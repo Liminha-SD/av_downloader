@@ -21,9 +21,9 @@ NC='\033[0m'
 # Funções de utilidade
 limpar() { clear; }
 pausar() { read -p "Pressione ENTER para continuar..."; }
-log() { echo -e "${GREEN}[+]${NC} $1"; }
-erro() { echo -e "${RED}[!]${NC} $1"; }
-aviso() { echo -e "${YELLOW}[i]${NC} $1"; }
+log() { echo -e "${GREEN}[+] $1${NC}"; }
+erro() { echo -e "${RED}[!] $1${NC}"; }
+aviso() { echo -e "${YELLOW}[i] $1${NC}"; }
 
 # Banner
 mostrar_banner() {
@@ -59,7 +59,7 @@ solicitar_url() {
     local prompt_msg="$1"
     local url
     
-    echo -e "${YELLOW}Tip: Digite '0' ou deixe vazio para voltar${NC}"
+    echo -e "${YELLOW}Dica: Digite '0' ou deixe vazio para voltar${NC}" >&2
     read -p "$prompt_msg: " url
     
     if [[ -z "$url" || "$url" == "0" ]]; then
@@ -75,16 +75,22 @@ solicitar_url() {
 
 baixar_youtube() {
     local url="$1"
-    log "Baixando YouTube na MELHOR qualidade + Metadados completos..."
+    aviso "Iniciando download do YouTube na melhor qualidade..."
     
-    yt-dlp -f "bestvideo+bestaudio" \
+    if yt-dlp -f "bestvideo+bestaudio" \
            -o "$VIDEOS_DIR/YouTube/%(title)s [%(resolution)s].%(ext)s" \
            --embed-thumbnail \
            --embed-metadata \
            --embed-chapters \
            --convert-thumbnails jpg \
            --concurrent-fragments 5 \
-           "$url"
+           "$url"; then
+        log "Download do YouTube concluído com sucesso!"
+        return 0
+    else
+        erro "Falha ao baixar vídeo do YouTube."
+        return 1
+    fi
 }
 
 baixar_youtube_com_opcoes() {
@@ -93,14 +99,14 @@ baixar_youtube_com_opcoes() {
     
     while true; do
         mostrar_banner
-        echo -e "${CYAN}📺 OPÇÕES DE QUALIDADE - YOUTUBE${NC}"
+        echo -e "${CYAN}OPÇÕES DE QUALIDADE - YOUTUBE${NC}"
         echo ""
-        echo "1) 360p (rápido)"
-        echo "2) 480p (padrão)"
-        echo "3) 720p (HD)"
-        echo "4) 1080p (Full HD)"
-        echo "5) 🔥 MELHOR QUALIDADE DISPONÍVEL"
-        echo "0) Voltar"
+        echo -e "${CYAN}[1]${NC} 360p (rápido)"
+        echo -e "${CYAN}[2]${NC} 480p (padrão)"
+        echo -e "${CYAN}[3]${NC} 720p (HD)"
+        echo -e "${CYAN}[4]${NC} 1080p (Full HD)"
+        echo -e "${CYAN}[5]${NC} MELHOR QUALIDADE DISPONÍVEL"
+        echo -e "${RED}[0]${NC} Voltar"
         echo ""
         read -p "Opção: " qual
         
@@ -115,13 +121,17 @@ baixar_youtube_com_opcoes() {
             *) erro "Opção inválida!"; sleep 1; continue ;;
         esac
         
-        log "Baixando do YouTube com metadados..."
-        yt-dlp -f "$qualidade" \
+        aviso "Baixando com qualidade selecionada e metadados..."
+        if yt-dlp -f "$qualidade" \
                -o "$VIDEOS_DIR/YouTube/%(title)s [%(resolution)s].%(ext)s" \
                --embed-thumbnail \
                --embed-metadata \
                --convert-thumbnails jpg \
-               "$url"
+               "$url"; then
+            log "Download concluído com sucesso!"
+        else
+            erro "Erro durante o download do YouTube."
+        fi
         pausar
         break
     done
@@ -129,36 +139,36 @@ baixar_youtube_com_opcoes() {
 
 baixar_tiktok() {
     local url="$1"
-    log "Baixando TikTok na MELHOR qualidade..."
+    aviso "Baixando TikTok na MELHOR qualidade..."
     
-    # Tentativa 1: Método normal - MELHOR QUALIDADE
+    # Tentativa 1: Método normal
     if yt-dlp -f "best" \
               -o "$TIKTOK_DIR/%(title)s [%(id)s].%(ext)s" \
               --no-warnings \
               "$url" 2>/dev/null; then
-        log "✅ TikTok baixado na melhor qualidade!"
+        log "TikTok baixado com sucesso!"
         return 0
     fi
     
-    # Tentativa 2: Com cookies - MELHOR QUALIDADE
+    # Tentativa 2: Com cookies
     aviso "Método 1 falhou. Tentando com cookies..."
     if yt-dlp --cookies-from-browser chrome \
               -f "best" \
               -o "$TIKTOK_DIR/%(title)s [%(id)s].%(ext)s" \
               --no-warnings \
               "$url" 2>/dev/null; then
-        log "✅ TikTok baixado via cookies na melhor qualidade!"
+        log "TikTok baixado via cookies com sucesso!"
         return 0
     fi
     
-    # Tentativa 3: User-agent especial - MELHOR QUALIDADE
+    # Tentativa 3: User-agent especial
     aviso "Método 2 falhou. Tentando método alternativo..."
     if yt-dlp --referer "https://www.tiktok.com/" \
               --user-agent "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36" \
               -f "best" \
               -o "$TIKTOK_DIR/%(title)s [%(id)s].%(ext)s" \
               "$url" 2>/dev/null; then
-        log "✅ TikTok baixado na melhor qualidade (método alternativo)!"
+        log "TikTok baixado com sucesso (método alternativo)!"
         return 0
     fi
     
@@ -170,35 +180,49 @@ baixar_tiktok() {
         local video_url=$(curl -s "$api_url" | grep -o '"play_addr":"[^"]*"' | cut -d'"' -f4 | sed 's/\\\\\//\//g')
         
         if [ -n "$video_url" ]; then
-            log "Encontrado via API. Baixando na melhor qualidade..."
-            wget -O "$TIKTOK_DIR/tiktok_$video_id.mp4" "$video_url"
-            return $?
+            aviso "Encontrado via API. Baixando..."
+            if wget -O "$TIKTOK_DIR/tiktok_$video_id.mp4" "$video_url"; then
+                log "TikTok baixado via API com sucesso!"
+                return 0
+            fi
         fi
     fi
     
-    erro "Não foi possível baixar o TikTok"
+    erro "Não foi possível baixar o TikTok após várias tentativas."
     return 1
 }
 
 baixar_instagram() {
     local url="$1"
-    log "Baixando Instagram na MELHOR qualidade..."
+    aviso "Baixando Instagram na MELHOR qualidade..."
     
-    yt-dlp -f "best" \
+    if yt-dlp -f "best" \
            -o "$INSTAGRAM_DIR/%(title)s.%(ext)s" \
-           --add-metadata \
-           "$url"
+           --embed-metadata \
+           "$url"; then
+        log "Download do Instagram concluído com sucesso!"
+        return 0
+    else
+        erro "Falha ao baixar do Instagram."
+        return 1
+    fi
 }
 
 baixar_universal() {
     local url="$1"
     local site="$2"
-    log "Baixando $site na MELHOR qualidade disponível..."
+    aviso "Baixando $site na MELHOR qualidade disponível..."
     
-    yt-dlp -f "best" \
+    if yt-dlp -f "best" \
            -o "$VIDEOS_DIR/$site/%(title)s.%(ext)s" \
-           --add-metadata \
-           "$url"
+           --embed-metadata \
+           "$url"; then
+        log "Download de $site concluído com sucesso!"
+        return 0
+    else
+        erro "Falha ao baixar de $site."
+        return 1
+    fi
 }
 
 # ==============================================
@@ -211,7 +235,7 @@ baixar_inteligente() {
     aviso "Cole a URL do vídeo (qualquer site):"
     echo "Ex: YouTube, TikTok, Instagram, Twitter, etc."
     echo ""
-    echo -e "${GREEN}🚀 SERÁ BAIXADO NA MELHOR QUALIDADE DISPONÍVEL${NC}"
+    echo -e "${GREEN}DOWNLOAD NA MELHOR QUALIDADE DISPONÍVEL${NC}"
     echo ""
     
     local url=$(solicitar_url "URL")
@@ -219,37 +243,26 @@ baixar_inteligente() {
     
     # Detectar site
     local site=$(detectar_site "$url")
-    log "Site detectado: $site"
+    aviso "Site detectado: $site"
     
     # Criar pastas específicas
     mkdir -p "$VIDEOS_DIR/$site"
     
-    # Baixar conforme o site - SEMPRE MELHOR QUALIDADE
-    local status=0
+    # Baixar conforme o site
     case "$site" in
         YouTube)
             baixar_youtube "$url"
-            status=$?
             ;;
         TikTok)
             baixar_tiktok "$url"
-            status=$?
             ;;
         Instagram)
             baixar_instagram "$url"
-            status=$?
             ;;
         *)
             baixar_universal "$url" "$site"
-            status=$?
             ;;
     esac
-    
-    if [ $status -eq 0 ]; then
-        log "✅ Download concluído na MELHOR qualidade!"
-    else
-        erro "❌ Falha no download. Tente outro método."
-    fi
     
     pausar
 }
@@ -261,7 +274,7 @@ baixar_inteligente() {
 baixar_mp3_universal() {
     mostrar_banner
     echo ""
-    echo -e "${GREEN}🎵 CONVERTER PARA MP3 - MELHOR QUALIDADE${NC}"
+    echo -e "${GREEN}CONVERTER PARA MP3 - MELHOR QUALIDADE${NC}"
     echo ""
     
     local url=$(solicitar_url "Cole a URL para converter em MP3")
@@ -270,15 +283,21 @@ baixar_mp3_universal() {
     # SEMPRE usa 320k (melhor qualidade para MP3)
     local bitrate="320K"
     
-    log "Convertendo para MP3 na melhor qualidade (320k)..."
-    yt-dlp -x --audio-format mp3 \
+    aviso "Convertendo para MP3 (320k) e embutindo metadados..."
+    if yt-dlp -x --audio-format mp3 \
            --audio-quality "$bitrate" \
            -o "$MUSICAS_DIR/%(title)s.%(ext)s" \
            --embed-thumbnail \
-           --add-metadata \
+           --embed-metadata \
+           --convert-thumbnails jpg \
+           --parse-metadata "uploader:%(artist)s" \
+           --parse-metadata "uploader:%(album)s" \
            --parse-metadata "title:%(title)s" \
-           --parse-metadata "artist:%(uploader)s" \
-           "$url"
+           "$url"; then
+        log "Conversão para MP3 concluída com sucesso!"
+    else
+        erro "Falha na conversão para MP3."
+    fi
     
     pausar
 }
@@ -286,7 +305,7 @@ baixar_mp3_universal() {
 ver_downloads() {
     mostrar_banner
     echo ""
-    echo -e "${CYAN}📁 CONTEÚDO BAIXADO (MELHOR QUALIDADE)${NC}"
+    echo -e "${CYAN}CONTEÚDO BAIXADO (MELHOR QUALIDADE)${NC}"
     echo ""
     
     # Lista organizada
@@ -310,7 +329,7 @@ ver_downloads() {
     done
     
     # Espaço em disco
-    echo -e "${CYAN}💾 ESPAÇO DISPONÍVEL:${NC}"
+    echo -e "${CYAN}ESPAÇO DISPONÍVEL:${NC}"
     df -h | grep -E "Use%|/storage"
     
     pausar
@@ -320,51 +339,56 @@ menu_config() {
     while true; do
         mostrar_banner
         echo ""
-        echo -e "${CYAN}⚙️  CONFIGURAÇÕES - MELHOR QUALIDADE${NC}"
+        echo -e "${CYAN}CONFIGURAÇÕES - MELHOR QUALIDADE${NC}"
         echo ""
-        echo "1) Atualizar yt-dlp (para suporte máximo)"
-        echo "2) Instalar dependências extras"
-        echo "3) Informações de qualidade"
-        echo "4) Limpar cache"
-        echo "5) Testar velocidade de download"
-        echo "0) Voltar"
+        echo -e "${CYAN}[1]${NC} Atualizar yt-dlp"
+        echo -e "${CYAN}[2]${NC} Instalar dependências extras"
+        echo -e "${CYAN}[3]${NC} Informações de qualidade"
+        echo -e "${CYAN}[4]${NC} Limpar cache"
+        echo -e "${CYAN}[5]${NC} Testar velocidade de download"
+        echo -e "${RED}[0]${NC} Voltar"
         
         read -p "Opção: " opcao
         
         case $opcao in
             1)
-                log "Atualizando yt-dlp para versão mais recente..."
-                pip install --upgrade yt-dlp
-                log "✅ Versão atual: $(yt-dlp --version)"
+                aviso "Atualizando yt-dlp..."
+                if pip install --upgrade yt-dlp; then
+                    log "yt-dlp atualizado. Versão atual: $(yt-dlp --version)"
+                else
+                    erro "Falha ao atualizar yt-dlp."
+                fi
                 pausar
                 ;;
             2)
-                log "Instalando dependências para melhor qualidade..."
-                pkg install python ffmpeg curl wget -y
-                pip install yt-dlp[default]
-                log "✅ Dependências instaladas!"
+                aviso "Instalando dependências..."
+                if pkg install python ffmpeg curl wget -y && pip install yt-dlp[default]; then
+                    log "Dependências instaladas com sucesso!"
+                else
+                    erro "Erro ao instalar dependências."
+                fi
                 pausar
                 ;;
             3)
                 echo ""
-                echo -e "${GREEN}Configurar Qualidade Padrão:${NC}"
+                echo -e "${GREEN}Configuração de Qualidade:${NC}"
                 echo "Atualmente: MELHOR QUALIDADE SEMPRE"
                 echo ""
                 echo "O sistema está configurado para sempre usar:"
-                echo "- YouTube: bestvideo+bestaudio"
-                echo "- TikTok/Instagram: best"
-                echo "- MP3: 320k"
+                echo "- YouTube: melhor vídeo + melhor áudio disponível"
+                echo "- TikTok/Instagram: melhor arquivo direto"
+                echo "- MP3: taxa de bits constante de 320k"
                 pausar
                 ;;
             4)
-                log "Limpando cache..."
+                aviso "Limpando cache..."
                 yt-dlp --rm-cache-dir
                 rm -rf ~/.cache/yt-dlp/*
-                log "✅ Cache limpo!"
+                log "Cache limpo com sucesso!"
                 pausar
                 ;;
             5)
-                log "Testando velocidade..."
+                aviso "Testando velocidade..."
                 curl -o /dev/null -w "Velocidade: %{speed_download} bytes/seg\n" https://speedtest.selectel.ru/10MB.bin
                 pausar
                 ;;
@@ -391,7 +415,7 @@ main() {
     # Verificar dependências
     if ! command -v yt-dlp &> /dev/null; then
         erro "yt-dlp não está instalado!"
-        aviso "Instalando..."
+        aviso "Tentando instalação automática..."
         pkg install python ffmpeg -y
         pip install yt-dlp[default]
     fi
@@ -399,14 +423,14 @@ main() {
     while true; do
         mostrar_banner
         
-        echo -e "${GREEN}🚀 DOWNLOAD NA MELHOR QUALIDADE${NC}"
+        echo -e "${GREEN}DOWNLOAD NA MELHOR QUALIDADE${NC}"
         echo ""
-        echo -e "🎯 ${CYAN}[1]${NC} Baixar QUALQUER vídeo (MELHOR qualidade)"
-        echo -e "📥 ${CYAN}[2]${NC} Baixar YouTube (com opções)"
-        echo -e "🎵 ${CYAN}[3]${NC} Converter para MP3 (320k - MELHOR)"
-        echo -e "📊 ${CYAN}[4]${NC} Ver downloads"
-        echo -e "⚙️  ${CYAN}[5]${NC} Configurações"
-        echo -e "🚪 ${RED}[0]${NC} Sair"
+        echo -e "${CYAN}[1]${NC} Baixar QUALQUER vídeo (MELHOR qualidade)"
+        echo -e "${CYAN}[2]${NC} Baixar YouTube (com opções)"
+        echo -e "${CYAN}[3]${NC} Converter para MP3 (320k - MELHOR)"
+        echo -e "${CYAN}[4]${NC} Ver downloads"
+        echo -e "${CYAN}[5]${NC} Configurações"
+        echo -e "${RED}[0]${NC} Sair"
         echo ""
         echo -e "${YELLOW}════════════════════════════════════════${NC}"
         echo ""
@@ -421,7 +445,7 @@ main() {
             5) menu_config ;;
             0|sair|exit)
                 echo ""
-                log "Até logo! 👋"
+                log "Saindo do script. Até logo!"
                 exit 0
                 ;;
             *)
