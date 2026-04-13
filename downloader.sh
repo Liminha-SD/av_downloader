@@ -8,7 +8,9 @@ MUSICAS_DIR="$HOME/storage/downloads/musicas"
 PLAYLISTS_DIR="$HOME/storage/downloads/playlists"
 TIKTOK_DIR="$VIDEOS_DIR/TikTok"
 INSTAGRAM_DIR="$VIDEOS_DIR/Instagram"
+COOKIES_FILE="$HOME/storage/downloads/cookies.txt"
 MAX_SIMULTANEOS=2
+YT_DLP_OPTS=""
 
 # Cores
 RED='\033[1;31m'
@@ -25,6 +27,26 @@ pausar() { read -p "Pressione ENTER para continuar..."; }
 log() { echo -e "${GREEN}[+] $1${NC}"; }
 erro() { echo -e "${RED}[!] $1${NC}"; }
 aviso() { echo -e "${YELLOW}[i] $1${NC}"; }
+
+verificar_cookies() {
+    if [[ -f "$COOKIES_FILE" ]]; then
+        # Proteção: Ajusta permissões para que apenas o dono do arquivo possa ler/escrever
+        chmod 600 "$COOKIES_FILE" 2>/dev/null
+        
+        # Validação básica: Verifica se o arquivo parece ser um formato de cookies válido para o yt-dlp
+        if grep -qE "Netscape|cookiestxt" "$COOKIES_FILE"; then
+            YT_DLP_OPTS="--cookies $COOKIES_FILE"
+            log "Cookies ativos e protegidos: $COOKIES_FILE"
+        else
+            YT_DLP_OPTS=""
+            erro "Arquivo de cookies em: $COOKIES_FILE parece inválido!"
+            aviso "Dica: Exportar do navegador no formato Netscape/cookies.txt"
+        fi
+    else
+        YT_DLP_OPTS=""
+        aviso "Cookies inativos (arquivo não encontrado em: $COOKIES_FILE)"
+    fi
+}
 
 # Banner
 mostrar_banner() {
@@ -92,7 +114,7 @@ solicitar_formato() {
 baixar_youtube() {
     local url="$1"
     aviso "Iniciando download na melhor qualidade..."
-    if yt-dlp -f "bestvideo+bestaudio" \
+    if yt-dlp $YT_DLP_OPTS -f "bestvideo+bestaudio/best" \
            -o "$VIDEOS_DIR/YouTube/%(title)s [%(resolution)s].%(ext)s" \
            --embed-thumbnail --embed-metadata --embed-chapters \
            --convert-thumbnails jpg --concurrent-fragments 5 --no-playlist "$url"; then
@@ -116,14 +138,14 @@ baixar_playlist_youtube() {
 
     aviso "Obtendo informações da fonte... Aguarde."
     # Obtém o nome da playlist ou canal
-    local playlist_name=$(yt-dlp --print "%(playlist_title,uploader,channel)s" --no-warnings --playlist-items 1 "$url" | head -1)
+    local playlist_name=$(yt-dlp $YT_DLP_OPTS --print "%(playlist_title,uploader,channel)s" --no-warnings --playlist-items 1 "$url" | head -1)
     [[ -z "$playlist_name" || "$playlist_name" == "NA" ]] && playlist_name="Download_Playlist"
     
-    # Limpa caracteres inválidos para nomes de pasta
-    playlist_name=$(echo "$playlist_name" | sed 's/[<>:"/\\|?*]//g')
+    # Limpa caracteres inválidos para nomes de pasta e remove sufixos indesejados
+    playlist_name=$(echo "$playlist_name" | sed -E 's/ - ([Vv]ide[oó]s?|[Vv]ídeos)//g' | sed 's/[<>:"/\\|?*]//g')
 
     aviso "Coletando links de '$playlist_name'..."
-    local lista_urls=$(yt-dlp --flat-playlist --get-url --no-warnings "$url")
+    local lista_urls=$(yt-dlp $YT_DLP_OPTS --flat-playlist --get-url --no-warnings "$url")
     local total=$(echo "$lista_urls" | wc -l)
     
     log "Encontrados $total vídeos. Baixando $MAX_SIMULTANEOS por vez..."
@@ -133,14 +155,14 @@ baixar_playlist_youtube() {
     for vid_url in $lista_urls; do
         ((count++))
         (
-            local output_template="$PLAYLISTS_DIR/$playlist_name/${count} - %(title)s.%(ext)s"
+            local output_template="$PLAYLISTS_DIR/$playlist_name/%(title)s.%(ext)s"
             if [[ "$formato" == "audio" ]]; then
-                yt-dlp -x --audio-format mp3 --audio-quality 320K -o "$output_template" \
+                yt-dlp $YT_DLP_OPTS -x --audio-format mp3 --audio-quality 320K -o "$output_template" \
                        --embed-thumbnail --embed-metadata --convert-thumbnails jpg \
                        --parse-metadata "uploader:%(artist)s" --parse-metadata "uploader:%(album)s" \
                        --no-warnings --quiet "$vid_url"
             else
-                yt-dlp -f "bestvideo+bestaudio/best" -o "$output_template" \
+                yt-dlp $YT_DLP_OPTS -f "bestvideo+bestaudio/best" -o "$output_template" \
                        --embed-thumbnail --embed-metadata --convert-thumbnails jpg \
                        --no-warnings --quiet "$vid_url"
             fi
@@ -187,7 +209,7 @@ baixar_youtube_com_opcoes() {
         esac
         
         aviso "Baixando..."
-        yt-dlp -f "$qualidade" -o "$VIDEOS_DIR/YouTube/%(title)s.%(ext)s" \
+        yt-dlp $YT_DLP_OPTS -f "$qualidade" -o "$VIDEOS_DIR/YouTube/%(title)s.%(ext)s" \
                --embed-thumbnail --embed-metadata --convert-thumbnails jpg --no-playlist "$url"
         pausar
         break
@@ -197,7 +219,7 @@ baixar_youtube_com_opcoes() {
 baixar_tiktok() {
     local url="$1"
     aviso "Baixando TikTok..."
-    if yt-dlp -f "best" -o "$TIKTOK_DIR/%(title)s.%(ext)s" --no-warnings "$url" 2>/dev/null; then
+    if yt-dlp $YT_DLP_OPTS -f "best" -o "$TIKTOK_DIR/%(title)s.%(ext)s" --no-warnings "$url" 2>/dev/null; then
         log "TikTok concluído!"
     else
         erro "Falha no TikTok."
@@ -207,7 +229,7 @@ baixar_tiktok() {
 baixar_instagram() {
     local url="$1"
     aviso "Baixando Instagram..."
-    if yt-dlp -f "best" -o "$INSTAGRAM_DIR/%(title)s.%(ext)s" --embed-metadata "$url"; then
+    if yt-dlp $YT_DLP_OPTS -f "best" -o "$INSTAGRAM_DIR/%(title)s.%(ext)s" --embed-metadata "$url"; then
         log "Instagram concluído!"
     else
         erro "Falha no Instagram."
@@ -218,7 +240,7 @@ baixar_universal() {
     local url="$1"
     local site="$2"
     aviso "Baixando $site..."
-    if yt-dlp -f "best" -o "$VIDEOS_DIR/$site/%(title)s.%(ext)s" --embed-metadata "$url"; then
+    if yt-dlp $YT_DLP_OPTS -f "best" -o "$VIDEOS_DIR/$site/%(title)s.%(ext)s" --embed-metadata "$url"; then
         log "Download concluído!"
     else
         erro "Falha no download."
@@ -256,7 +278,7 @@ baixar_mp3_universal() {
     [[ $? -ne 0 ]] && return
     
     aviso "Processando áudio..."
-    yt-dlp -x --audio-format mp3 --audio-quality 320K -o "$MUSICAS_DIR/%(title)s.%(ext)s" \
+    yt-dlp $YT_DLP_OPTS -x --audio-format mp3 --audio-quality 320K -o "$MUSICAS_DIR/%(title)s.%(ext)s" \
            --embed-thumbnail --embed-metadata --convert-thumbnails jpg \
            --parse-metadata "uploader:%(artist)s" --parse-metadata "uploader:%(album)s" "$url"
     pausar
@@ -286,15 +308,17 @@ menu_config() {
         echo -e "[2] Instalar dependências"
         echo -e "[3] Limpar cache"
         echo -e "[4] Downloads Simultâneos (Playlist): $MAX_SIMULTANEOS"
+        echo -e "[5] Verificar/Ativar Cookies (Arquivo: $COOKIES_FILE)"
         echo -e "${RED}[0] Voltar${NC}"
         echo ""
         read -p "Opção: " opcao
         case $opcao in
             1) pip install --upgrade yt-dlp && log "Atualizado!" ; pausar ;;
             2) pkg install python ffmpeg curl wget -y && pip install yt-dlp[default] ; pausar ;;
-            3) yt-dlp --rm-cache-dir ; rm -rf ~/.cache/yt-dlp/* ; log "Limpo!" ; pausar ;;
+            3) yt-dlp $YT_DLP_OPTS --rm-cache-dir ; rm -rf ~/.cache/yt-dlp/* ; log "Limpo!" ; pausar ;;
             4) read -p "Quantos vídeos baixar por vez? (Sugerido: 2-3): " num
                if [[ "$num" =~ ^[0-9]+$ ]]; then MAX_SIMULTANEOS=$num ; log "Alterado!" ; else erro "Incorreto!" ; fi ; sleep 1 ;;
+            5) verificar_cookies ; pausar ;;
             0) return ;;
             *) erro "Opção inválida!" ; sleep 1 ;;
         esac
@@ -304,6 +328,7 @@ menu_config() {
 main() {
     mkdir -p "$VIDEOS_DIR"/{YouTube,TikTok,Instagram,Twitter,Facebook,Twitch,Pinterest,Outros}
     mkdir -p "$MUSICAS_DIR" "$PLAYLISTS_DIR"
+    verificar_cookies
     
     while true; do
         mostrar_banner
