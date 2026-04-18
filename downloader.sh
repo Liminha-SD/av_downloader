@@ -3,9 +3,10 @@
 # Detecta automaticamente o site
 
 # Configurações iniciais
-VIDEOS_DIR="$HOME/storage/downloads/videos"
-MUSICAS_DIR="$HOME/storage/downloads/musicas"
-PLAYLISTS_DIR="$HOME/storage/downloads/playlists"
+BASE_DIR="/sdcard/Download/av-downloader"
+VIDEOS_DIR="$BASE_DIR/videos"
+MUSICAS_DIR="$BASE_DIR/musicas"
+PLAYLISTS_DIR="$BASE_DIR/playlists"
 TIKTOK_DIR="$VIDEOS_DIR/TikTok"
 INSTAGRAM_DIR="$VIDEOS_DIR/Instagram"
 COOKIES_FILE="$HOME/storage/downloads/cookies.txt"
@@ -130,6 +131,7 @@ baixar_playlist_youtube() {
     mostrar_banner
     echo -e "${GREEN}BAIXAR PLAYLIST OU CANAL COMPLETO${NC}"
     echo ""
+
     local url=$(solicitar_url "Cole a URL da Playlist ou Canal")
     [[ $? -ne 0 ]] && return
 
@@ -137,45 +139,47 @@ baixar_playlist_youtube() {
     [[ $? -ne 0 ]] && return
 
     aviso "Obtendo informações da fonte... Aguarde."
-    # Obtém o nome da playlist ou canal
-    local playlist_name=$(yt-dlp $YT_DLP_OPTS --print "%(playlist_title,uploader,channel)s" --no-warnings --playlist-items 1 "$url" | head -1)
-    [[ -z "$playlist_name" || "$playlist_name" == "NA" ]] && playlist_name="Download_Playlist"
-    
-    # Limpa caracteres inválidos para nomes de pasta e remove sufixos indesejados
-    playlist_name=$(echo "$playlist_name" | sed -E 's/ - ([Vv]ide[oó]s?|[Vv]ídeos)//g' | sed 's/[<>:"/\\|?*]//g')
 
-    aviso "Coletando links de '$playlist_name'..."
-    local lista_urls=$(yt-dlp $YT_DLP_OPTS --flat-playlist --get-url --no-warnings "$url")
-    local total=$(echo "$lista_urls" | wc -l)
-    
-    log "Encontrados $total vídeos. Baixando $MAX_SIMULTANEOS por vez..."
-    mkdir -p "$PLAYLISTS_DIR/$playlist_name"
-    
-    local count=0
-    for vid_url in $lista_urls; do
-        ((count++))
-        (
-            local output_template="$PLAYLISTS_DIR/$playlist_name/%(title)s.%(ext)s"
-            if [[ "$formato" == "audio" ]]; then
-                yt-dlp $YT_DLP_OPTS -x --audio-format mp3 --audio-quality 320K -o "$output_template" \
-                       --embed-thumbnail --embed-metadata --convert-thumbnails jpg \
-                       --parse-metadata "uploader:%(artist)s" --parse-metadata "uploader:%(album)s" \
-                       --no-warnings --quiet "$vid_url"
-            else
-                yt-dlp $YT_DLP_OPTS -f "bestvideo+bestaudio/best" -o "$output_template" \
-                       --embed-thumbnail --embed-metadata --convert-thumbnails jpg \
-                       --no-warnings --quiet "$vid_url"
-            fi
-            echo -e "${GREEN}[OK] Item $count/$total finalizado${NC}"
-        ) &
+    # %(channel)s primeiro: evita sufixos como "Canal - Videos" que playlist_title retorna em abas de canal
+    local raw_name=$(yt-dlp $YT_DLP_OPTS \
+        --print "%(channel,playlist_title,uploader)s" \
+        --no-warnings --playlist-items 1 "$url" | head -1)
 
-        # Controle de concorrência
-        while [ $(jobs -r | wc -l) -ge "$MAX_SIMULTANEOS" ]; do
-            sleep 2
-        done
+    [[ -z "$raw_name" || "$raw_name" == "NA" ]] && raw_name="Download_Playlist"
+
+    local playlist_name=$(echo "$raw_name" | tr -d '<>:"/\\|?*' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    local pasta="$PLAYLISTS_DIR/$playlist_name"
+    mkdir -p "$pasta"
+
+    # Busca títulos e URLs em duas listas paralelas
+    mapfile -t titulos < <(yt-dlp $YT_DLP_OPTS --flat-playlist --print "%(title)s" --no-warnings "$url")
+    mapfile -t urls    < <(yt-dlp $YT_DLP_OPTS --flat-playlist --get-url --no-warnings "$url")
+
+    local total=${#urls[@]}
+    log "Encontrados $total itens em '$playlist_name'."
+
+    for i in "${!urls[@]}"; do
+        local count=$((i + 1))
+        local titulo="${titulos[$i]}"
+        local vid_url="${urls[$i]}"
+
+        aviso "[$count/$total] $titulo"
+
+        if [[ "$formato" == "audio" ]]; then
+            yt-dlp $YT_DLP_OPTS -x --audio-format mp3 --audio-quality 320K \
+                -o "$pasta/%(title)s.mp3" --embed-thumbnail --embed-metadata \
+                --convert-thumbnails jpg --no-warnings --quiet "$vid_url"
+        else
+            yt-dlp $YT_DLP_OPTS -f "bestvideo+bestaudio/best" \
+                --merge-output-format mkv \
+                -o "$pasta/%(title)s.mkv" --embed-thumbnail --embed-metadata \
+                --convert-thumbnails jpg --concurrent-fragments 5 \
+                --no-warnings --quiet "$vid_url"
+        fi
+
+        log "[✓] $count/$total - $titulo"
     done
-    
-    wait
+
     log "Playlist '$playlist_name' concluída com sucesso!"
     pausar
 }
