@@ -262,6 +262,39 @@ def separar_shorts(entries: list[dict], progresso=None) -> tuple[list[dict], lis
     return videos, shorts
 
 
+# ── Identificação de lives ────────────────────────────────────────
+#
+# Aqui o yt-dlp entrega tudo de graça na listagem: "is_live" (no ar),
+# "is_upcoming" (agendada) e "was_live" (gravação de uma live encerrada).
+# Nos canais, as lives ficam numa aba própria, separada da aba Videos.
+
+LIVE_STATUS = {"is_live", "is_upcoming", "was_live", "post_live"}
+
+
+def entrada_e_live(item: dict) -> bool:
+    return str(item.get("live_status") or "") in LIVE_STATUS
+
+
+def filtro_sem_live(info: dict, *, incomplete: bool = False) -> str | None:
+    """Rede de segurança do yt-dlp: recusa lives já na extração completa.
+
+    Protege do caso em que a listagem não marcou o item (uma transmissão que
+    começou depois) — sem isso, o download de uma live só terminaria quando a
+    transmissão acabasse, travando a vaga na fila.
+    """
+    if str(info.get("live_status") or "") in LIVE_STATUS or info.get("is_live"):
+        return "live ignorada"
+    return None
+
+
+def separar_lives(entries: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Divide as entradas em (vídeos normais, lives)."""
+    normais, lives = [], []
+    for item in entries:
+        (lives if entrada_e_live(item) else normais).append(item)
+    return normais, lives
+
+
 def versao_tupla(versao: str) -> tuple[int, ...]:
     """Compara versões numericamente: "2026.07.04" == "2026.7.4" (PEP 440)."""
     return tuple(int(p) for p in re.findall(r"\d+", versao))
@@ -285,8 +318,12 @@ def resumo_cookies(caminho: str) -> tuple[str, str]:
         return "Cookies inativos (arquivo não encontrado)", "dim"
     try:
         linhas = arquivo.read_text(errors="ignore").splitlines()
-    except OSError:
-        return "Não foi possível ler o arquivo de cookies", "yellow"
+    except PermissionError:
+        if IS_TERMUX:
+            return "Sem permissão — rode: termux-setup-storage", "red"
+        return "Sem permissão para ler o arquivo", "red"
+    except OSError as exc:
+        return f"Erro ao ler o arquivo: {exc.strerror or exc}", "red"
 
     total = 0
     validades: list[float] = []
@@ -366,6 +403,7 @@ class Config:
     embed_thumbnail: bool = True
     embed_metadata: bool = True
     ignorar_shorts: bool = True
+    ignorar_lives: bool = True
     auto_update: bool = True
     theme: str = THEMES[0]
 
@@ -544,8 +582,9 @@ class Status:
     WARN = ("✓", "Concluído*", "yellow")
     ERROR = ("✗", "Erro", "bold red")
     CANCELLED = ("⊘", "Cancelado", "dim")
+    IGNORED = ("⊘", "Live ignorada", "dim")
 
-    FINAIS = (DONE, WARN, ERROR, CANCELLED)
+    FINAIS = (DONE, WARN, ERROR, CANCELLED, IGNORED)
     ATIVOS = (QUEUED, DOWNLOADING, COOKIES, CONVERTING)
 
 
@@ -560,6 +599,7 @@ class Job:
     fmt: str  # "video:best" | "video:1080" | ... | "audio"
     dest_dir: str
     video_id: str = ""
+    bloquear_live: bool = False
     usar_cookies: bool = False
     tentou_cookies: bool = False
     id: int = field(default_factory=lambda: next(_job_ids))
@@ -593,6 +633,7 @@ def build_ydl_opts(job: Job, cfg: Config, hook, pp_hook, cookies: dict | None = 
         "socket_timeout": 20,
         "progress_hooks": [hook],
         "postprocessor_hooks": [pp_hook],
+        **({"match_filter": filtro_sem_live} if job.bloquear_live else {}),
         **(cookies or {}),
     }
 
@@ -745,6 +786,7 @@ def resumir_info(url: str, info: dict) -> dict:
                     "url": e.get("url") or e.get("webpage_url"),
                     "title": e.get("title") or f"Item {i + 1}",
                     "duration": e.get("duration"),
+                    "live_status": e.get("live_status"),
                 }
                 for i, e in enumerate(entries)
                 if e.get("url") or e.get("webpage_url")
@@ -758,6 +800,7 @@ def resumir_info(url: str, info: dict) -> dict:
         "title": info.get("title") or "Sem título",
         "uploader": info.get("uploader") or info.get("channel") or "—",
         "duration": info.get("duration"),
+        "live_status": info.get("live_status"),
     }
 
 
@@ -775,11 +818,25 @@ def fonte_de_shorts(url: str) -> bool:
     return url_de_short(url) or url.rstrip("/").lower().endswith("/shorts")
 
 
-def expandir_canal(summary: dict, cfg: Config, ignorar_shorts: bool) -> dict:
+def fonte_de_lives(url: str) -> bool:
+    """URL que pede lives explicitamente: aba /streams (ou /live) do canal."""
+    fim = url.rstrip("/").lower()
+    return fim.endswith("/streams") or fim.endswith("/live")
+
+
+def expandir_canal(summary: dict, cfg: Config, ignorar_shorts: bool,
+                   ignorar_lives: bool = False) -> dict:
     """Converte um canal (lista de abas) na lista de vídeos das suas abas."""
     entries: list[dict] = []
+    lives_ignoradas = False
     for aba in summary["tabs"]:
-        if ignorar_shorts and aba["title"].rstrip().lower().endswith("shorts"):
+        titulo_aba = aba["title"].rstrip().lower()
+        if ignorar_shorts and titulo_aba.endswith("shorts"):
+            continue
+        # A aba "Live" reúne transmissões e suas gravações; a aba "Videos"
+        # já não traz nada disso.
+        if ignorar_lives and (titulo_aba.endswith("live") or titulo_aba.endswith("streams")):
+            lives_ignoradas = True
             continue
         try:
             resumo_aba = resumir_info(aba["url"], fetch_info(aba["url"], cfg))
@@ -800,6 +857,8 @@ def expandir_canal(summary: dict, cfg: Config, ignorar_shorts: bool) -> dict:
         "entries": entries,
         "shorts_ignorados": 0,
         "aba_shorts_ignorada": ignorar_shorts,
+        "lives_ignoradas": 0,
+        "aba_lives_ignorada": lives_ignoradas,
     }
 
 
@@ -913,9 +972,16 @@ class AddDownloadScreen(ModalScreen[dict | None]):
             # ou aba /shorts) — nunca junto de uma playlist ou canal.
             ignorar = self._cfg.ignorar_shorts and not fonte_de_shorts(self._url)
 
+            ignorar_lives = self._cfg.ignorar_lives and not fonte_de_lives(self._url)
+
             if summary["kind"] == "canal":
                 self.app.call_from_thread(self._status_analise, "Listando vídeos do canal…")
-                summary = expandir_canal(summary, self._cfg, ignorar)
+                summary = expandir_canal(summary, self._cfg, ignorar, ignorar_lives)
+
+            if ignorar_lives and summary["kind"] == "playlist" and not summary.get("aba_lives_ignorada"):
+                videos, lives = separar_lives(summary["entries"])
+                summary["entries"] = videos
+                summary["lives_ignoradas"] = len(lives)
 
             if ignorar and summary["kind"] == "playlist" and not summary.get("aba_shorts_ignorada"):
                 def aviso(quantos: int) -> None:
@@ -1003,6 +1069,10 @@ class AddDownloadScreen(ModalScreen[dict | None]):
             if ignorados or summary.get("aba_shorts_ignorada"):
                 texto.append("\nShorts   ", "bold")
                 texto.append(f"{ignorados} ignorados" if ignorados else "ignorados", "yellow")
+            lives = summary.get("lives_ignoradas") or 0
+            if lives or summary.get("aba_lives_ignorada"):
+                texto.append("\nLives    ", "bold")
+                texto.append(f"{lives} ignoradas" if lives else "ignoradas", "yellow")
         else:
             self._novos = []
             texto.append("Duração  ", "bold")
@@ -1014,6 +1084,9 @@ class AddDownloadScreen(ModalScreen[dict | None]):
             if ja:
                 texto.append("\nJá tenho ", "bold")
                 texto.append("este arquivo na pasta", "green")
+            if str(summary.get("live_status") or "") in LIVE_STATUS:
+                texto.append("\nAviso    ", "bold")
+                texto.append("é uma live — o download vai até ela terminar", "yellow")
 
         try:
             self.query_one("#add-info", Static).update(texto)
@@ -1131,6 +1204,9 @@ class SettingsScreen(ModalScreen[bool]):
                     yield Switch(value=cfg.ignorar_shorts, id="cfg-shorts")
                     yield Label("Ignorar Shorts em playlists e canais")
                 with Horizontal(classes="linha-switch"):
+                    yield Switch(value=cfg.ignorar_lives, id="cfg-lives")
+                    yield Label("Ignorar lives (e suas gravações)")
+                with Horizontal(classes="linha-switch"):
                     yield Switch(value=cfg.auto_update, id="cfg-autoupdate")
                     yield Label("Atualizar o yt-dlp ao iniciar o app")
             with Horizontal(classes="botoes"):
@@ -1170,6 +1246,7 @@ class SettingsScreen(ModalScreen[bool]):
         cfg.embed_thumbnail = self.query_one("#cfg-thumb", Switch).value
         cfg.embed_metadata = self.query_one("#cfg-meta", Switch).value
         cfg.ignorar_shorts = self.query_one("#cfg-shorts", Switch).value
+        cfg.ignorar_lives = self.query_one("#cfg-lives", Switch).value
         cfg.auto_update = self.query_one("#cfg-autoupdate", Switch).value
         cfg.save()
         self.dismiss(True)
@@ -1647,6 +1724,7 @@ class AVDownloaderApp(App):
                         fmt=fmt,
                         dest_dir=str(pasta),
                         video_id=item.get("id") or "",
+                        bloquear_live=self.config.ignorar_lives,
                     )
                 )
         else:
@@ -1832,6 +1910,12 @@ class AVDownloaderApp(App):
             opts = build_ydl_opts(job, self.config, hook, pp_hook, cookies)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([job.url])
+
+            if job.bloquear_live and not job.filepath:
+                # O yt-dlp recusou pelo filtro: era uma live não detectada na
+                # listagem. Não é erro — é o comportamento pedido.
+                self._set_status(job, Status.IGNORED)
+                return
 
             self._registrar_historico(job)
             self._set_status(job, Status.DONE)

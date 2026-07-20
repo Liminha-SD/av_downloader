@@ -24,6 +24,10 @@ vídeos & músicas · melhor qualidade sempre
 - **Sem Shorts junto** — ao baixar uma playlist ou um canal, os Shorts do
   YouTube ficam de fora (vídeo e áudio); eles só são baixados quando você
   cola o link do Short ou da aba `/shorts`. Desligável nas Configurações.
+- **Sem lives junto** — transmissões ao vivo, agendadas e as gravações de
+  lives encerradas também ficam de fora de playlists e canais; só entram
+  quando você cola o link da live ou da aba `/streams`. Um filtro extra no
+  download impede que uma transmissão no ar trave a fila.
 - **Não baixa o que você já tem** — antes de montar a fila, o app lê a pasta
   de destino e pula o que já está lá (mostra "440 novos de 445"). Vale para
   arquivos baixados por versões anteriores e pelo script antigo.
@@ -126,6 +130,18 @@ caro:
 
 Para URL de canal, o app usa a aba **Videos** (que já não contém Shorts),
 sem custo nenhum.
+
+### Como as lives são identificadas
+
+Aqui é mais simples: o próprio yt-dlp informa o estado de cada item na
+listagem — `is_live` (no ar), `is_upcoming` (agendada), `was_live` (gravação
+de uma live encerrada) —, sem custo de rede. Em canais, as lives ficam numa
+aba separada ("Live"), que o app simplesmente não abre.
+
+Como rede de segurança, todo item vindo de playlist/canal leva um filtro que
+faz o yt-dlp recusar o download se, na hora, o vídeo estiver ao vivo — caso
+de uma transmissão que começou depois da listagem. O item aparece na fila
+como **"Live ignorada"**, sem contar como erro.
 
 ### Como o app sabe o que já foi baixado
 
