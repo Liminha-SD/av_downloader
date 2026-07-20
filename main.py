@@ -18,8 +18,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from importlib import metadata
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 def _ensure_venv() -> None:
@@ -35,11 +38,12 @@ _ensure_venv()
 
 try:
     import yt_dlp
+    from yt_dlp.utils import sanitize_filename
     from rich.text import Text
     from textual import on
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Container, Horizontal, Vertical
+    from textual.containers import Container, Horizontal, Vertical, VerticalScroll
     from textual.coordinate import Coordinate
     from textual.screen import ModalScreen
     from textual.theme import Theme
@@ -98,6 +102,15 @@ LUNA_THEME = Theme(
 )
 
 MAX_PLAYLIST_ITEMS = 500
+
+# Shorts têm no máximo 3 minutos: acima disso não há o que checar.
+SHORTS_MAX_DURACAO = 180
+SHORTS_CHECK_WORKERS = 8
+
+# Registro do que já foi baixado, guardado dentro da própria pasta de destino
+REGISTRO_ARQUIVO = ".avd-baixados.json"
+EXTS_AUDIO = {".mp3", ".m4a", ".opus", ".ogg", ".oga", ".flac", ".wav", ".aac"}
+EXTS_VIDEO = {".mkv", ".mp4", ".webm", ".mov", ".avi", ".flv", ".ts", ".m4v"}
 
 BANNER = "▄▀█ █░█ · █▀▄ █░░\n█▀█ ░▀░ · █▄▀ █▄▄"
 TAGLINE = "vídeos & músicas · melhor qualidade sempre"
@@ -175,6 +188,72 @@ def fmt_duration(segundos) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
+# ── Identificação de Shorts do YouTube ────────────────────────────
+#
+# Na aba /shorts as URLs já vêm marcadas, mas em playlists (inclusive a de
+# uploads do canal) os Shorts aparecem como "watch?v=" normais. A duração
+# também não basta: desde 2024 um Short pode ter até 3 minutos. A fonte
+# confiável é a própria URL de Short: youtube.com/shorts/<id> responde 200
+# quando é Short e redireciona (303) quando é vídeo comum.
+
+
+class _SemRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def url_de_short(url: str) -> bool:
+    return "/shorts/" in (url or "")
+
+
+def _consultar_short(video_id: str) -> bool:
+    opener = build_opener(_SemRedirect)
+    opener.addheaders = [("User-Agent", "Mozilla/5.0")]
+    req = Request(f"https://www.youtube.com/shorts/{video_id}", method="HEAD")
+    try:
+        return opener.open(req, timeout=8).status == 200
+    except HTTPError as exc:
+        return exc.code == 200
+    except Exception:
+        return False  # na dúvida, trata como vídeo comum (não descarta nada)
+
+
+def separar_shorts(entries: list[dict], progresso=None) -> tuple[list[dict], list[dict]]:
+    """Divide as entradas em (vídeos, shorts).
+
+    Resolve o que dá de graça (URL de Short, duração acima do limite) e só
+    consulta a rede para os casos ambíguos, em paralelo.
+    """
+    videos: list[dict] = []
+    shorts: list[dict] = []
+    duvidosos: list[dict] = []
+
+    for item in entries:
+        duracao = item.get("duration")
+        if url_de_short(item.get("url", "")):
+            shorts.append(item)
+        elif duracao is not None and duracao > SHORTS_MAX_DURACAO:
+            videos.append(item)
+        elif item.get("id"):
+            duvidosos.append(item)
+        else:
+            videos.append(item)
+
+    if duvidosos:
+        if progresso:
+            progresso(len(duvidosos))
+        with ThreadPoolExecutor(max_workers=SHORTS_CHECK_WORKERS) as pool:
+            resultados = list(pool.map(lambda i: _consultar_short(i["id"]), duvidosos))
+        for item, e_short in zip(duvidosos, resultados):
+            (shorts if e_short else videos).append(item)
+
+    # Preserva a ordem original da playlist
+    ordem = {id(item): pos for pos, item in enumerate(entries)}
+    videos.sort(key=lambda i: ordem[id(i)])
+    shorts.sort(key=lambda i: ordem[id(i)])
+    return videos, shorts
+
+
 def versao_tupla(versao: str) -> tuple[int, ...]:
     """Compara versões numericamente: "2026.07.04" == "2026.7.4" (PEP 440)."""
     return tuple(int(p) for p in re.findall(r"\d+", versao))
@@ -235,6 +314,7 @@ class Config:
     audio_quality: str = "320"
     embed_thumbnail: bool = True
     embed_metadata: bool = True
+    ignorar_shorts: bool = True
     auto_update: bool = True
     theme: str = THEMES[0]
 
@@ -301,6 +381,102 @@ def clear_history() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════
+# Registro de downloads já feitos
+# ══════════════════════════════════════════════════════════════════
+#
+# O registro fica dentro da pasta de destino: acompanha os arquivos se a
+# pasta for movida e some junto se ela for apagada. Um item só conta como
+# baixado se o arquivo ainda estiver lá — apagou, baixa de novo. Arquivos
+# antigos (sem registro) são reconhecidos pelo nome.
+
+_registro_lock = threading.Lock()
+
+
+def tipo_do_formato(fmt: str) -> str:
+    return "audio" if fmt == "audio" else "video"
+
+
+def chave_registro(video_id: str, fmt: str) -> str:
+    return f"{video_id}:{tipo_do_formato(fmt)}"
+
+
+def carregar_registro(pasta: Path | str) -> dict:
+    try:
+        dados = json.loads((Path(pasta) / REGISTRO_ARQUIVO).read_text())
+        itens = dados.get("itens")
+        return itens if isinstance(itens, dict) else {}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+
+
+def registrar_baixado(pasta: Path | str, video_id: str, fmt: str, arquivo: str, titulo: str) -> None:
+    if not video_id or not arquivo:
+        return
+    pasta = Path(pasta)
+    with _registro_lock:
+        itens = carregar_registro(pasta)
+        itens[chave_registro(video_id, fmt)] = {
+            "arquivo": Path(arquivo).name,
+            "titulo": titulo,
+            "data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        }
+        try:
+            pasta.mkdir(parents=True, exist_ok=True)
+            (pasta / REGISTRO_ARQUIVO).write_text(
+                json.dumps({"versao": 1, "itens": itens}, indent=2, ensure_ascii=False)
+            )
+        except OSError:
+            pass
+
+
+def _estado_da_pasta(pasta: Path | str, fmt: str) -> tuple[set[str], set[str]]:
+    """Lê a pasta e devolve (chaves já baixadas, nomes de arquivo existentes)."""
+    tipo = tipo_do_formato(fmt)
+    extensoes = EXTS_AUDIO if tipo == "audio" else EXTS_VIDEO
+
+    arquivos: set[str] = set()
+    try:
+        for item in Path(pasta).iterdir():
+            if item.is_file() and item.suffix.lower() in extensoes:
+                arquivos.add(item.name)
+    except OSError:
+        return set(), set()  # pasta ainda não existe
+
+    nomes: set[str] = set()
+    for arquivo in arquivos:
+        stem = Path(arquivo).stem
+        nomes.add(stem)
+        # "Título [1920x1080]" -> "Título" (sufixo do modelo de nome)
+        nomes.add(re.sub(r"\s*\[[^\[\]]*\]$", "", stem))
+
+    registro = carregar_registro(pasta)
+    chaves = {
+        chave
+        for chave, dado in registro.items()
+        if chave.endswith(f":{tipo}") and isinstance(dado, dict) and dado.get("arquivo") in arquivos
+    }
+    return chaves, nomes
+
+
+def separar_baixados(entries: list[dict], pasta: Path | str, fmt: str) -> tuple[list[dict], list[dict]]:
+    """Divide as entradas em (ainda não baixadas, já baixadas)."""
+    chaves, nomes = _estado_da_pasta(pasta, fmt)
+    if not chaves and not nomes:
+        return list(entries), []
+
+    novos: list[dict] = []
+    baixados: list[dict] = []
+    for item in entries:
+        video_id = item.get("id") or ""
+        titulo = sanitize_filename(item.get("title") or "")
+        if (video_id and chave_registro(video_id, fmt) in chaves) or (titulo and titulo in nomes):
+            baixados.append(item)
+        else:
+            novos.append(item)
+    return novos, baixados
+
+
+# ══════════════════════════════════════════════════════════════════
 # Modelo de download
 # ══════════════════════════════════════════════════════════════════
 
@@ -331,6 +507,7 @@ class Job:
     site: str
     fmt: str  # "video:best" | "video:1080" | ... | "audio"
     dest_dir: str
+    video_id: str = ""
     id: int = field(default_factory=lambda: next(_job_ids))
     status: tuple = Status.QUEUED
     progress: float = 0.0
@@ -420,17 +597,33 @@ def resumir_info(url: str, info: dict) -> dict:
 
     entries = [e for e in (info.get("entries") or []) if e]
     if info.get("_type") == "playlist" and entries:
+        titulo = info.get("title") or info.get("channel") or info.get("uploader") or "Playlist"
+        uploader = info.get("channel") or info.get("uploader") or "—"
+
+        # URL de canal raiz devolve as abas (Videos, Shorts, Live), não vídeos
+        abas = [e for e in entries if e.get("_type") == "playlist" and e.get("webpage_url")]
+        if len(abas) == len(entries):
+            return {
+                "kind": "canal",
+                "url": url,
+                "site": site,
+                "title": titulo,
+                "uploader": uploader,
+                "tabs": [{"title": a.get("title") or "", "url": a["webpage_url"]} for a in abas],
+            }
+
         return {
             "kind": "playlist",
             "url": url,
             "site": site,
-            "title": info.get("title") or info.get("channel") or info.get("uploader") or "Playlist",
-            "uploader": info.get("channel") or info.get("uploader") or "—",
+            "title": titulo,
+            "uploader": uploader,
             "entries": [
                 {
-                    "id": e.get("id"),
+                    "id": e.get("id") or "",
                     "url": e.get("url") or e.get("webpage_url"),
                     "title": e.get("title") or f"Item {i + 1}",
+                    "duration": e.get("duration"),
                 }
                 for i, e in enumerate(entries)
                 if e.get("url") or e.get("webpage_url")
@@ -440,9 +633,49 @@ def resumir_info(url: str, info: dict) -> dict:
         "kind": "single",
         "url": url,
         "site": site,
+        "id": info.get("id") or "",
         "title": info.get("title") or "Sem título",
         "uploader": info.get("uploader") or info.get("channel") or "—",
         "duration": info.get("duration"),
+    }
+
+
+def pasta_destino(summary: dict, fmt: str, cfg: Config) -> Path:
+    """Onde os arquivos deste download vão parar."""
+    if summary["kind"] == "playlist":
+        return cfg.dir_playlists / sanitize_name(summary["title"])
+    if fmt == "audio":
+        return cfg.dir_musicas
+    return cfg.dir_videos / sanitize_name(summary["site"])
+
+
+def fonte_de_shorts(url: str) -> bool:
+    """URL que pede Shorts explicitamente: link de Short ou aba /shorts."""
+    return url_de_short(url) or url.rstrip("/").lower().endswith("/shorts")
+
+
+def expandir_canal(summary: dict, cfg: Config, ignorar_shorts: bool) -> dict:
+    """Converte um canal (lista de abas) na lista de vídeos das suas abas."""
+    entries: list[dict] = []
+    for aba in summary["tabs"]:
+        if ignorar_shorts and aba["title"].rstrip().lower().endswith("shorts"):
+            continue
+        try:
+            resumo_aba = resumir_info(aba["url"], fetch_info(aba["url"], cfg))
+        except Exception:
+            continue  # aba indisponível não invalida o resto do canal
+        if resumo_aba["kind"] == "playlist":
+            entries.extend(resumo_aba["entries"])
+
+    return {
+        "kind": "playlist",
+        "url": summary["url"],
+        "site": summary["site"],
+        "title": summary["title"],
+        "uploader": summary["uploader"],
+        "entries": entries,
+        "shorts_ignorados": 0,
+        "aba_shorts_ignorada": ignorar_shorts,
     }
 
 
@@ -491,57 +724,85 @@ class AddDownloadScreen(ModalScreen[dict | None]):
         self._url = url
         self._cfg = cfg
         self._summary: dict | None = None
+        self._novos: list[dict] = []
+        self._ja_baixado = False
 
     def compose(self) -> ComposeResult:
         with Container(classes="modal caixa-add"):
             yield Label("Novo download", classes="modal-titulo")
-            yield Static(self._url, id="add-url")
-            with Horizontal(id="add-loading"):
-                yield LoadingIndicator()
-                yield Static("Analisando link…", id="add-loading-texto")
-            yield Static("", id="add-info")
-            yield Label("Formato", classes="campo-label", id="add-fmt-label")
-            yield Select(
-                [
-                    ("Vídeo — Melhor qualidade", "video:best"),
-                    ("Vídeo — até 1080p", "video:1080"),
-                    ("Vídeo — até 720p", "video:720"),
-                    ("Vídeo — até 480p", "video:480"),
-                    ("Vídeo — até 360p", "video:360"),
-                    (f"Áudio — MP3 {self._cfg.audio_quality}k", "audio"),
-                ],
-                allow_blank=False,
-                value="video:best",
-                id="add-fmt",
-            )
-            yield Label("Escopo", classes="campo-label", id="add-escopo-label")
-            yield Select(
-                [("Playlist completa", "playlist"), ("Somente este vídeo", "single")],
-                allow_blank=False,
-                value="playlist",
-                id="add-escopo",
-            )
+            with VerticalScroll(classes="modal-corpo"):
+                yield Static(self._url, id="add-url")
+                with Horizontal(id="add-loading"):
+                    yield LoadingIndicator()
+                    yield Static("Analisando link…", id="add-loading-texto")
+                yield Static("", id="add-info")
+                # Lado a lado: economiza altura em telas de celular
+                with Horizontal(id="add-selects"):
+                    with Vertical(id="add-fmt-box"):
+                        yield Label("Formato", classes="campo-label", id="add-fmt-label")
+                        yield Select(
+                            [
+                                ("Vídeo — Melhor qualidade", "video:best"),
+                                ("Vídeo — até 1080p", "video:1080"),
+                                ("Vídeo — até 720p", "video:720"),
+                                ("Vídeo — até 480p", "video:480"),
+                                ("Vídeo — até 360p", "video:360"),
+                                (f"Áudio — MP3 {self._cfg.audio_quality}k", "audio"),
+                            ],
+                            allow_blank=False,
+                            value="video:best",
+                            id="add-fmt",
+                        )
+                    with Vertical(id="add-escopo-box"):
+                        yield Label("Escopo", classes="campo-label", id="add-escopo-label")
+                        yield Select(
+                            [("Playlist completa", "playlist"), ("Somente este vídeo", "single")],
+                            allow_blank=False,
+                            value="playlist",
+                            id="add-escopo",
+                        )
             with Horizontal(classes="botoes"):
                 yield Button("Adicionar à fila", variant="success", id="btn-ok", disabled=True)
                 yield Button("Cancelar", id="btn-cancelar")
 
     def on_mount(self) -> None:
         self.query_one("#add-info").display = False
-        self.query_one("#add-fmt").display = False
-        self.query_one("#add-fmt-label").display = False
-        self.query_one("#add-escopo").display = False
-        self.query_one("#add-escopo-label").display = False
+        self.query_one("#add-selects").display = False
+        self.query_one("#add-escopo-box").display = False
         self.run_worker(self._fetch, thread=True, exclusive=True)
 
     def _fetch(self) -> None:
         try:
-            info = fetch_info(self._url, self._cfg)
-            summary = resumir_info(self._url, info)
+            summary = resumir_info(self._url, fetch_info(self._url, self._cfg))
+
+            # Shorts só entram quando pedidos explicitamente (link de Short
+            # ou aba /shorts) — nunca junto de uma playlist ou canal.
+            ignorar = self._cfg.ignorar_shorts and not fonte_de_shorts(self._url)
+
+            if summary["kind"] == "canal":
+                self.app.call_from_thread(self._status_analise, "Listando vídeos do canal…")
+                summary = expandir_canal(summary, self._cfg, ignorar)
+
+            if ignorar and summary["kind"] == "playlist" and not summary.get("aba_shorts_ignorada"):
+                def aviso(quantos: int) -> None:
+                    self.app.call_from_thread(
+                        self._status_analise, f"Identificando Shorts ({quantos} a checar)…"
+                    )
+
+                videos, shorts = separar_shorts(summary["entries"], progresso=aviso)
+                summary["entries"] = videos
+                summary["shorts_ignorados"] = len(shorts)
         except Exception as exc:  # rede, URL inválida, bloqueio do site…
             msg = str(exc)
             self.app.call_from_thread(self._mostrar_erro, msg)
             return
         self.app.call_from_thread(self._mostrar_info, summary)
+
+    def _status_analise(self, texto: str) -> None:
+        try:
+            self.query_one("#add-loading-texto", Static).update(texto)
+        except Exception:
+            pass
 
     def _mostrar_erro(self, msg: str) -> None:
         try:
@@ -559,35 +820,76 @@ class AddDownloadScreen(ModalScreen[dict | None]):
         try:
             self._summary = summary
             self.query_one("#add-loading").display = False
-            info = self.query_one("#add-info", Static)
-            info.display = True
-
-            texto = Text()
-            texto.append("Título   ", "bold")
-            texto.append(f"{summary['title']}\n")
-            texto.append("Canal    ", "bold")
-            texto.append(f"{summary['uploader']}\n")
-            texto.append("Site     ", "bold")
-            texto.append(f"{summary['site']}\n")
-            if summary["kind"] == "playlist":
-                n = len(summary["entries"])
-                texto.append("Itens    ", "bold")
-                texto.append(f"{n}", "bold magenta")
-                if n >= MAX_PLAYLIST_ITEMS:
-                    texto.append(f"  (limitado aos {MAX_PLAYLIST_ITEMS} primeiros)", "dim")
-            else:
-                texto.append("Duração  ", "bold")
-                texto.append(fmt_duration(summary.get("duration")))
-            info.update(texto)
-
-            self.query_one("#add-fmt").display = True
-            self.query_one("#add-fmt-label").display = True
+            self.query_one("#add-info").display = True
+            self.query_one("#add-url").display = False  # o título já identifica
+            self.query_one("#add-selects").display = True
             if summary["kind"] == "playlist" and self._tem_video_unico():
-                self.query_one("#add-escopo").display = True
-                self.query_one("#add-escopo-label").display = True
+                self.query_one("#add-escopo-box").display = True
+            self._render_info()
             botao = self.query_one("#btn-ok", Button)
             botao.disabled = False
             botao.focus()
+        except Exception:
+            pass
+
+    @on(Select.Changed, "#add-fmt")
+    def _formato_mudou(self) -> None:
+        if self._summary is not None:
+            self._render_info()
+
+    def _render_info(self) -> None:
+        """Monta o painel — o que já foi baixado depende do formato escolhido."""
+        summary = self._summary
+        if summary is None:
+            return
+        fmt = str(self.query_one("#add-fmt", Select).value)
+        pasta = pasta_destino(summary, fmt, self._cfg)
+
+        texto = Text()
+        texto.append("Título   ", "bold")
+        texto.append(f"{summary['title']}\n")
+        texto.append("Canal    ", "bold")
+        texto.append(f"{summary['uploader']}\n")
+        texto.append("Site     ", "bold")
+        texto.append(f"{summary['site']}\n")
+
+        if summary["kind"] == "playlist":
+            self._novos, ja_baixados = separar_baixados(summary["entries"], pasta, fmt)
+            total = len(summary["entries"])
+            texto.append("Itens    ", "bold")
+            texto.append(f"{len(self._novos)}", "bold magenta")
+            texto.append(" novos", "bold magenta")
+            texto.append(f" de {total}")
+            if total >= MAX_PLAYLIST_ITEMS:
+                texto.append(f" (limitado a {MAX_PLAYLIST_ITEMS})", "dim")
+            if ja_baixados:
+                texto.append("\nJá tenho ", "bold")
+                texto.append(f"{len(ja_baixados)} — serão pulados", "green")
+            ignorados = summary.get("shorts_ignorados") or 0
+            if ignorados or summary.get("aba_shorts_ignorada"):
+                texto.append("\nShorts   ", "bold")
+                texto.append(f"{ignorados} ignorados" if ignorados else "ignorados", "yellow")
+        else:
+            self._novos = []
+            texto.append("Duração  ", "bold")
+            texto.append(fmt_duration(summary.get("duration")))
+            _, ja = separar_baixados(
+                [{"id": summary.get("id", ""), "title": summary["title"]}], pasta, fmt
+            )
+            self._ja_baixado = bool(ja)
+            if ja:
+                texto.append("\nJá tenho ", "bold")
+                texto.append("este arquivo na pasta", "green")
+
+        try:
+            self.query_one("#add-info", Static).update(texto)
+            botao = self.query_one("#btn-ok", Button)
+            if summary["kind"] == "playlist":
+                botao.label = "Adicionar à fila" if self._novos else "Nada novo para baixar"
+                botao.disabled = not self._novos
+            else:
+                botao.label = "Baixar de novo" if self._ja_baixado else "Adicionar à fila"
+                botao.disabled = False
         except Exception:
             pass
 
@@ -610,6 +912,7 @@ class AddDownloadScreen(ModalScreen[dict | None]):
             "kind": "single",
             "url": self._url,
             "site": self._summary["site"],
+            "id": video_id,
             "title": titulo,
             "uploader": self._summary["uploader"],
             "duration": None,
@@ -621,8 +924,12 @@ class AddDownloadScreen(ModalScreen[dict | None]):
             return
         summary = self._summary
         escopo = self.query_one("#add-escopo", Select)
-        if summary["kind"] == "playlist" and escopo.display and escopo.value == "single":
+        escopo_visivel = self.query_one("#add-escopo-box").display
+        if summary["kind"] == "playlist" and escopo_visivel and escopo.value == "single":
             summary = self._video_unico()
+        elif summary["kind"] == "playlist":
+            # Só o que ainda não está na pasta de destino
+            summary = {**summary, "entries": self._novos}
         self.dismiss({"summary": summary, "fmt": self.query_one("#add-fmt", Select).value})
 
     @on(Button.Pressed, "#btn-cancelar")
@@ -646,37 +953,42 @@ class SettingsScreen(ModalScreen[bool]):
         cfg = self._cfg
         with Container(classes="modal caixa-config"):
             yield Label("Configurações", classes="modal-titulo")
-            yield Label("Pasta base de downloads", classes="campo-label")
-            yield Input(value=cfg.base_dir, id="cfg-dir")
-            yield Label("Arquivo de cookies (formato Netscape)", classes="campo-label")
-            yield Input(value=cfg.cookies_file, id="cfg-cookies")
-            yield Static("", id="cfg-cookies-status")
-            with Horizontal(id="cfg-selects"):
-                with Vertical():
-                    yield Label("Downloads simultâneos", classes="campo-label")
-                    yield Select(
-                        [(str(n), n) for n in range(1, 6)],
-                        allow_blank=False,
-                        value=min(max(cfg.max_concurrent, 1), 5),
-                        id="cfg-simultaneos",
-                    )
-                with Vertical():
-                    yield Label("Qualidade do MP3", classes="campo-label")
-                    yield Select(
-                        [(f"{k} kbps", k) for k in ("128", "192", "256", "320")],
-                        allow_blank=False,
-                        value=cfg.audio_quality if cfg.audio_quality in ("128", "192", "256", "320") else "320",
-                        id="cfg-audio",
-                    )
-            with Horizontal(classes="linha-switch"):
-                yield Switch(value=cfg.embed_thumbnail, id="cfg-thumb")
-                yield Label("Incorporar thumbnail nos arquivos")
-            with Horizontal(classes="linha-switch"):
-                yield Switch(value=cfg.embed_metadata, id="cfg-meta")
-                yield Label("Incorporar metadados (título, artista…)")
-            with Horizontal(classes="linha-switch"):
-                yield Switch(value=cfg.auto_update, id="cfg-autoupdate")
-                yield Label("Atualizar o yt-dlp ao iniciar o app")
+            # Rolável: em telas baixas (Termux) os botões continuam alcançáveis
+            with VerticalScroll(classes="modal-corpo"):
+                yield Label("Pasta base de downloads", classes="campo-label")
+                yield Input(value=cfg.base_dir, id="cfg-dir")
+                yield Label("Arquivo de cookies (formato Netscape)", classes="campo-label")
+                yield Input(value=cfg.cookies_file, id="cfg-cookies")
+                yield Static("", id="cfg-cookies-status")
+                with Horizontal(id="cfg-selects"):
+                    with Vertical():
+                        yield Label("Downloads simultâneos", classes="campo-label")
+                        yield Select(
+                            [(str(n), n) for n in range(1, 6)],
+                            allow_blank=False,
+                            value=min(max(cfg.max_concurrent, 1), 5),
+                            id="cfg-simultaneos",
+                        )
+                    with Vertical():
+                        yield Label("Qualidade do MP3", classes="campo-label")
+                        yield Select(
+                            [(f"{k} kbps", k) for k in ("128", "192", "256", "320")],
+                            allow_blank=False,
+                            value=cfg.audio_quality if cfg.audio_quality in ("128", "192", "256", "320") else "320",
+                            id="cfg-audio",
+                        )
+                with Horizontal(classes="linha-switch"):
+                    yield Switch(value=cfg.embed_thumbnail, id="cfg-thumb")
+                    yield Label("Incorporar thumbnail nos arquivos")
+                with Horizontal(classes="linha-switch"):
+                    yield Switch(value=cfg.embed_metadata, id="cfg-meta")
+                    yield Label("Incorporar metadados (título, artista…)")
+                with Horizontal(classes="linha-switch"):
+                    yield Switch(value=cfg.ignorar_shorts, id="cfg-shorts")
+                    yield Label("Ignorar Shorts em playlists e canais")
+                with Horizontal(classes="linha-switch"):
+                    yield Switch(value=cfg.auto_update, id="cfg-autoupdate")
+                    yield Label("Atualizar o yt-dlp ao iniciar o app")
             with Horizontal(classes="botoes"):
                 yield Button("Salvar", variant="success", id="btn-salvar")
                 yield Button("Cancelar", id="btn-cancelar")
@@ -709,6 +1021,7 @@ class SettingsScreen(ModalScreen[bool]):
         cfg.audio_quality = str(self.query_one("#cfg-audio", Select).value)
         cfg.embed_thumbnail = self.query_one("#cfg-thumb", Switch).value
         cfg.embed_metadata = self.query_one("#cfg-meta", Switch).value
+        cfg.ignorar_shorts = self.query_one("#cfg-shorts", Switch).value
         cfg.auto_update = self.query_one("#cfg-autoupdate", Switch).value
         cfg.save()
         self.dismiss(True)
@@ -807,9 +1120,10 @@ class HelpScreen(ModalScreen[None]):
             yield Label("Atalhos de teclado", classes="modal-titulo")
             texto = Text()
             for tecla, descricao in self.ATALHOS:
-                texto.append(f"  {tecla:<7}", "bold cyan")
+                texto.append(f"  {tecla:<7}", "bold #019DEA")
                 texto.append(f"{descricao}\n")
-            yield Static(texto)
+            with VerticalScroll(classes="modal-corpo"):
+                yield Static(texto)
             with Horizontal(classes="botoes"):
                 yield Button("Fechar", variant="primary", id="btn-fechar")
 
@@ -902,6 +1216,17 @@ class AVDownloaderApp(App):
         text-style: bold;
         color: $primary;
         margin-bottom: 1;
+        height: 1;
+    }
+    /* O corpo cresce com o conteúdo até um teto proporcional à tela: o modal
+       fica compacto quando há pouca coisa e, quando há muita, rola por dentro
+       em vez de empurrar os botões para fora (telas baixas, Termux). */
+    /* 40vh deixa folga para título, botões, padding e borda em qualquer
+       altura de terminal — inclusive 20 linhas. */
+    .modal-corpo {
+        height: auto;
+        max-height: 40vh;
+        scrollbar-size-vertical: 1;
     }
     .campo-label {
         color: $text-muted;
@@ -938,6 +1263,16 @@ class AVDownloaderApp(App):
         margin-top: 1;
         height: auto;
     }
+    #add-selects {
+        height: auto;
+    }
+    #add-selects Vertical {
+        width: 1fr;
+        height: auto;
+    }
+    #add-fmt-box {
+        margin-right: 2;
+    }
     .caixa-config Input {
         margin-top: 0;
     }
@@ -968,7 +1303,7 @@ class AVDownloaderApp(App):
         width: 100;
     }
     #hist-tabela {
-        height: 16;
+        height: 40vh;
         margin-top: 1;
     }
     #hist-resumo {
@@ -1147,8 +1482,8 @@ class AVDownloaderApp(App):
         summary, fmt = resultado["summary"], str(resultado["fmt"])
         novos: list[Job] = []
 
+        pasta = pasta_destino(summary, fmt, self.config)
         if summary["kind"] == "playlist":
-            pasta = self.config.dir_playlists / sanitize_name(summary["title"])
             for item in summary["entries"]:
                 novos.append(
                     Job(
@@ -1157,13 +1492,10 @@ class AVDownloaderApp(App):
                         site=summary["site"],
                         fmt=fmt,
                         dest_dir=str(pasta),
+                        video_id=item.get("id") or "",
                     )
                 )
         else:
-            if fmt == "audio":
-                pasta = self.config.dir_musicas
-            else:
-                pasta = self.config.dir_videos / sanitize_name(summary["site"])
             novos.append(
                 Job(
                     url=summary["url"],
@@ -1171,8 +1503,14 @@ class AVDownloaderApp(App):
                     site=summary["site"],
                     fmt=fmt,
                     dest_dir=str(pasta),
+                    video_id=summary.get("id") or "",
                 )
             )
+
+        if not novos:
+            self.notify("Tudo dessa lista já está na pasta — nada a baixar.", timeout=6)
+            self.query_one("#url-input", Input).focus()
+            return
 
         tabela = self.query_one("#queue", DataTable)
         for job in novos:
@@ -1347,6 +1685,7 @@ class AVDownloaderApp(App):
                 tamanho = os.path.getsize(job.filepath)
             except OSError:
                 pass
+            registrar_baixado(job.dest_dir, job.video_id, job.fmt, job.filepath, job.title)
         append_history(
             {
                 "data": datetime.now().strftime("%d/%m/%Y %H:%M"),

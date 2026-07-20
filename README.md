@@ -21,6 +21,12 @@ vídeos & músicas · melhor qualidade sempre
 - **Playlists e canais** — cada item vira uma linha na fila, com pasta
   própria. Em links de vídeo dentro de playlist, você escolhe se quer só o
   vídeo ou a playlist inteira.
+- **Sem Shorts junto** — ao baixar uma playlist ou um canal, os Shorts do
+  YouTube ficam de fora (vídeo e áudio); eles só são baixados quando você
+  cola o link do Short ou da aba `/shorts`. Desligável nas Configurações.
+- **Não baixa o que você já tem** — antes de montar a fila, o app lê a pasta
+  de destino e pula o que já está lá (mostra "440 novos de 445"). Vale para
+  arquivos baixados por versões anteriores e pelo script antigo.
 - **Qualidade sob controle** — melhor qualidade (vídeo+áudio mesclados) ou
   limite de 1080p/720p/480p/360p.
 - **Conversão para MP3** — 128 a 320 kbps, com thumbnail e metadados
@@ -104,6 +110,42 @@ av-downloader/
 | `t` | Alternar tema visual |
 | `?` | Ajuda |
 | `q` | Sair |
+
+### Como os Shorts são identificados
+
+Em playlists (inclusive na lista de uploads do canal) os Shorts aparecem como
+vídeos comuns — a URL não os diferencia e a duração também não, já que um
+Short pode ter até 3 minutos. O app resolve assim, do mais barato ao mais
+caro:
+
+1. URL contendo `/shorts/` — é Short, sem custo;
+2. duração acima de 3 minutos — não é Short, sem custo (resolve a maioria);
+3. só o que sobra é confirmado em `youtube.com/shorts/<id>`, que responde
+   `200` para Short e redireciona para vídeo comum — em paralelo, ~0,2s por
+   item.
+
+Para URL de canal, o app usa a aba **Videos** (que já não contém Shorts),
+sem custo nenhum.
+
+### Como o app sabe o que já foi baixado
+
+A verificação é feita **na própria pasta de destino**, combinando duas fontes:
+
+1. **Nome do arquivo** — o título do vídeo é convertido em nome de arquivo com
+   a mesma função do yt-dlp, então arquivos antigos (baixados antes desta
+   funcionalidade, ou pelo `downloader.sh`) também são reconhecidos.
+2. **Registro `.avd-baixados.json`** — arquivo oculto dentro da pasta, com o
+   ID de cada vídeo baixado. Como acompanha a pasta, sobrevive a
+   reinstalações; e como é por ID, continua valendo se o autor renomear o
+   vídeo no YouTube (algo comum — canais testam títulos o tempo todo).
+
+Regras que valem a pena saber:
+
+- **Apagou o arquivo, baixa de novo**: o registro só conta se o arquivo ainda
+  estiver na pasta.
+- **Áudio e vídeo contam separado**: ter o MP4 não impede baixar o MP3.
+- Para um vídeo avulso que você já tem, o botão vira **"Baixar de novo"** —
+  a decisão continua sendo sua.
 
 ### Cookies (conteúdo com login)
 
