@@ -149,9 +149,42 @@ Regras que valem a pena saber:
 
 ### Cookies (conteúdo com login)
 
-Exporte os cookies do navegador no formato Netscape (`cookies.txt`) e informe
-o caminho em **Configurações** (`s`). O padrão é
-`~/storage/downloads/cookies.txt` no Termux e `~/cookies.txt` no desktop.
+Os cookies são usados **só quando fazem falta**: o app baixa tudo em paralelo
+sem eles e, se algum item falhar (idade restrita, vídeo de membros, "confirme
+que você não é um robô"), refaz **aquele item** com os cookies — um de cada
+vez. Isso mantém a velocidade, expõe sua conta em menos requisições e, como
+só um download escreve no `cookies.txt` por vez, evita corromper o arquivo (o
+yt-dlp o regrava ao terminar, guardando os cookies renovados pelo servidor —
+é o que faz o arquivo durar mais sem reexportar).
+
+**No desktop (menor manutenção):** em Configurações (`s`), escolha
+**"Ler direto do Firefox do sistema"**. Nada para exportar: enquanto você
+estiver logado no Firefox, funciona.
+
+**No celular (Termux):** o Android isola os dados do Firefox, então o app não
+consegue lê-los — aqui é o `cookies.txt` mesmo. Para ele durar o máximo
+possível, siga o procedimento oficial do yt-dlp:
+
+1. Instale o add-on [cookies.txt no Firefox
+   Android](https://addons.mozilla.org/en-US/android/addon/cookies-txt/);
+2. Abra uma **aba privada** e faça login no YouTube;
+3. Nessa mesma aba, vá para `youtube.com/robots.txt` (para não deixar
+   nenhuma aba do YouTube aberta);
+4. Exporte os cookies com o add-on (vai para a pasta Downloads, que é onde o
+   app procura: `~/storage/downloads/cookies.txt`);
+5. **Feche a janela privada** e não a reabra.
+
+O motivo do passo a passo: o YouTube rotaciona os cookies de abas abertas do
+YouTube por segurança, e é isso que invalida um arquivo exportado. Uma sessão
+privada encerrada fica "congelada" e dura muito mais.
+
+Em Configurações o app mostra o estado dos cookies — se há login válido,
+quantos são e **em quantos dias expiram** —, para você reexportar antes de
+falhar, não depois.
+
+> **Aviso:** usar a conta pessoal em automação tem risco (a própria wiki do
+> yt-dlp alerta para banimento temporário ou permanente). O recomendado é uma
+> conta secundária.
 
 ## Arquivos
 

@@ -7,6 +7,7 @@ real, histórico e configurações persistentes. Funciona no Termux e no desktop
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import json
 import os
@@ -74,6 +75,13 @@ IS_TERMUX = "com.termux" in os.environ.get("PREFIX", "") or Path("/data/data/com
 CONFIG_DIR = Path.home() / ".config" / "av-downloader"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "historico.json"
+COOKIES_BACKUP = CONFIG_DIR / "cookies-backup.txt"
+
+# Cookies de login do YouTube/Google (aparecem no cookies.txt exportado)
+COOKIES_LOGIN = {
+    "SID", "HSID", "SSID", "APISID", "SAPISID",
+    "__Secure-1PSID", "__Secure-3PSID", "LOGIN_INFO",
+}
 
 THEMES = [
     "luna",
@@ -270,6 +278,48 @@ def cookies_validos(caminho: str) -> bool:
         return False
 
 
+def resumo_cookies(caminho: str) -> tuple[str, str]:
+    """(mensagem, estilo) sobre o estado do arquivo de cookies."""
+    arquivo = Path(caminho).expanduser()
+    if not arquivo.is_file():
+        return "Cookies inativos (arquivo não encontrado)", "dim"
+    try:
+        linhas = arquivo.read_text(errors="ignore").splitlines()
+    except OSError:
+        return "Não foi possível ler o arquivo de cookies", "yellow"
+
+    total = 0
+    validades: list[float] = []
+    for linha in linhas:
+        if linha.startswith("#") or not linha.strip():
+            continue
+        partes = linha.split("\t")
+        if len(partes) < 7:
+            continue
+        dominio, expira, nome = partes[0], partes[4], partes[5]
+        if "youtube" not in dominio and "google" not in dominio:
+            continue
+        total += 1
+        if nome in COOKIES_LOGIN:
+            try:
+                validades.append(float(expira))
+            except ValueError:
+                pass
+
+    if not total:
+        return "Arquivo sem cookies do YouTube — exporte de novo", "yellow"
+    if not validades:
+        return f"{total} cookies do YouTube, mas sem login", "yellow"
+
+    futuras = [v for v in validades if v > 0]
+    if futuras and min(futuras) < time.time():
+        return "Login expirado — exporte os cookies de novo", "red"
+    if futuras:
+        dias = int((min(futuras) - time.time()) // 86400)
+        return f"Login ativo · {total} cookies · expira em {dias} dias", "green"
+    return f"Login ativo · {total} cookies (sessão)", "green"
+
+
 def abrir_no_sistema(caminho: str) -> bool:
     for opener in (["termux-open"], ["xdg-open"], ["open"]):
         if shutil.which(opener[0]):
@@ -310,6 +360,7 @@ class Config:
     cookies_file: str = str(
         Path("~/storage/downloads/cookies.txt" if IS_TERMUX else "~/cookies.txt").expanduser()
     )
+    cookies_modo: str = "arquivo"  # "arquivo" | "firefox"
     max_concurrent: int = 2
     audio_quality: str = "320"
     embed_thumbnail: bool = True
@@ -487,6 +538,7 @@ class JobCancelled(Exception):
 class Status:
     QUEUED = ("○", "Na fila", "dim")
     DOWNLOADING = ("↓", "Baixando", "bold #019DEA")
+    COOKIES = ("↻", "Com cookies", "bold yellow")
     CONVERTING = ("~", "Processando", "bold yellow")
     DONE = ("✓", "Concluído", "bold green")
     WARN = ("✓", "Concluído*", "yellow")
@@ -494,7 +546,7 @@ class Status:
     CANCELLED = ("⊘", "Cancelado", "dim")
 
     FINAIS = (DONE, WARN, ERROR, CANCELLED)
-    ATIVOS = (QUEUED, DOWNLOADING, CONVERTING)
+    ATIVOS = (QUEUED, DOWNLOADING, COOKIES, CONVERTING)
 
 
 _job_ids = itertools.count(1)
@@ -508,6 +560,8 @@ class Job:
     fmt: str  # "video:best" | "video:1080" | ... | "audio"
     dest_dir: str
     video_id: str = ""
+    usar_cookies: bool = False
+    tentou_cookies: bool = False
     id: int = field(default_factory=lambda: next(_job_ids))
     status: tuple = Status.QUEUED
     progress: float = 0.0
@@ -527,7 +581,7 @@ class Job:
         return "Melhor" if qualidade == "best" else f"{qualidade}p"
 
 
-def build_ydl_opts(job: Job, cfg: Config, hook, pp_hook) -> dict:
+def build_ydl_opts(job: Job, cfg: Config, hook, pp_hook, cookies: dict | None = None) -> dict:
     opts: dict = {
         "quiet": True,
         "no_warnings": True,
@@ -539,9 +593,8 @@ def build_ydl_opts(job: Job, cfg: Config, hook, pp_hook) -> dict:
         "socket_timeout": 20,
         "progress_hooks": [hook],
         "postprocessor_hooks": [pp_hook],
+        **(cookies or {}),
     }
-    if cookies_validos(cfg.cookies_file):
-        opts["cookiefile"] = str(Path(cfg.cookies_file).expanduser())
 
     pps: list[dict] = []
     if job.fmt == "audio":
@@ -572,7 +625,74 @@ def build_ydl_opts(job: Job, cfg: Config, hook, pp_hook) -> dict:
     return opts
 
 
-def fetch_info(url: str, cfg: Config) -> dict:
+# ══════════════════════════════════════════════════════════════════
+# Cookies
+# ══════════════════════════════════════════════════════════════════
+#
+# O yt-dlp regrava o arquivo de cookies ao terminar (guardando os que o
+# servidor renovou) — é isso que faz o arquivo durar mais sem reexportar.
+# Mas ele grava truncando o arquivo, sem ser atômico: dois downloads
+# simultâneos apontando para o mesmo cookies.txt podem destruí-lo. Por isso
+# o uso de cookies é serializado — só um download por vez os utiliza.
+
+_cookies_slot = threading.Lock()
+
+
+def cookies_no_navegador_disponivel() -> bool:
+    """Ler direto do Firefox só funciona no desktop (no Android é sandbox)."""
+    return not IS_TERMUX
+
+
+def cookies_disponiveis(cfg: Config) -> bool:
+    if cfg.cookies_modo == "firefox":
+        return cookies_no_navegador_disponivel()
+    return cookies_validos(cfg.cookies_file)
+
+
+def _proteger_cookies(cfg: Config) -> None:
+    """Guarda uma cópia antes de deixar o yt-dlp reescrever o arquivo."""
+    origem = Path(cfg.cookies_file).expanduser()
+    try:
+        if cookies_validos(str(origem)):
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(origem, COOKIES_BACKUP)
+    except OSError:
+        pass
+
+
+def _restaurar_cookies(cfg: Config) -> bool:
+    """Se a regravação deixou o arquivo inválido (app morto no meio), volta."""
+    origem = Path(cfg.cookies_file).expanduser()
+    try:
+        if origem.exists() and not cookies_validos(str(origem)) and cookies_validos(str(COOKIES_BACKUP)):
+            shutil.copyfile(COOKIES_BACKUP, origem)
+            return True
+    except OSError:
+        pass
+    return False
+
+
+@contextlib.contextmanager
+def sessao_cookies(cfg: Config):
+    """Empresta os cookies para um único yt-dlp por vez."""
+    if not cookies_disponiveis(cfg):
+        yield {}
+        return
+    if cfg.cookies_modo == "firefox":
+        # Leitura do perfil do navegador: não escreve nada, mas serializa
+        # junto para manter um caminho só.
+        with _cookies_slot:
+            yield {"cookiesfrombrowser": ("firefox", None, None, None)}
+        return
+    with _cookies_slot:
+        _proteger_cookies(cfg)
+        try:
+            yield {"cookiefile": str(Path(cfg.cookies_file).expanduser())}
+        finally:
+            _restaurar_cookies(cfg)
+
+
+def fetch_info(url: str, cfg: Config, usar_cookies: bool = False) -> dict:
     """Extrai metadados sem baixar (playlists de forma achatada)."""
     opts: dict = {
         "quiet": True,
@@ -582,11 +702,12 @@ def fetch_info(url: str, cfg: Config) -> dict:
         "playlist_items": f"1-{MAX_PLAYLIST_ITEMS}",
         "socket_timeout": 20,
     }
-    if cookies_validos(cfg.cookies_file):
-        opts["cookiefile"] = str(Path(cfg.cookies_file).expanduser())
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    return info or {}
+    if not usar_cookies:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False) or {}
+    with sessao_cookies(cfg) as cookies:
+        with yt_dlp.YoutubeDL({**opts, **cookies}) as ydl:
+            return ydl.extract_info(url, download=False) or {}
 
 
 def resumir_info(url: str, info: dict) -> dict:
@@ -663,7 +784,10 @@ def expandir_canal(summary: dict, cfg: Config, ignorar_shorts: bool) -> dict:
         try:
             resumo_aba = resumir_info(aba["url"], fetch_info(aba["url"], cfg))
         except Exception:
-            continue  # aba indisponível não invalida o resto do canal
+            try:  # pode ser aba que exige login
+                resumo_aba = resumir_info(aba["url"], fetch_info(aba["url"], cfg, usar_cookies=True))
+            except Exception:
+                continue  # aba indisponível não invalida o resto do canal
         if resumo_aba["kind"] == "playlist":
             entries.extend(resumo_aba["entries"])
 
@@ -771,9 +895,19 @@ class AddDownloadScreen(ModalScreen[dict | None]):
         self.query_one("#add-escopo-box").display = False
         self.run_worker(self._fetch, thread=True, exclusive=True)
 
+    def _analisar(self) -> dict:
+        """Sem cookies primeiro; só usa a conta se o link exigir login."""
+        try:
+            return resumir_info(self._url, fetch_info(self._url, self._cfg))
+        except Exception:
+            if not cookies_disponiveis(self._cfg):
+                raise
+            self.app.call_from_thread(self._status_analise, "Tentando com cookies…")
+            return resumir_info(self._url, fetch_info(self._url, self._cfg, usar_cookies=True))
+
     def _fetch(self) -> None:
         try:
-            summary = resumir_info(self._url, fetch_info(self._url, self._cfg))
+            summary = self._analisar()
 
             # Shorts só entram quando pedidos explicitamente (link de Short
             # ou aba /shorts) — nunca junto de uma playlist ou canal.
@@ -957,7 +1091,17 @@ class SettingsScreen(ModalScreen[bool]):
             with VerticalScroll(classes="modal-corpo"):
                 yield Label("Pasta base de downloads", classes="campo-label")
                 yield Input(value=cfg.base_dir, id="cfg-dir")
-                yield Label("Arquivo de cookies (formato Netscape)", classes="campo-label")
+                yield Label("Cookies (para conteúdo com login)", classes="campo-label")
+                opcoes_ck = [("Arquivo cookies.txt", "arquivo")]
+                if cookies_no_navegador_disponivel():
+                    opcoes_ck.append(("Ler direto do Firefox do sistema", "firefox"))
+                validos = {valor for _, valor in opcoes_ck}
+                yield Select(
+                    opcoes_ck,
+                    allow_blank=False,
+                    value=cfg.cookies_modo if cfg.cookies_modo in validos else "arquivo",
+                    id="cfg-cookies-modo",
+                )
                 yield Input(value=cfg.cookies_file, id="cfg-cookies")
                 yield Static("", id="cfg-cookies-status")
                 with Horizontal(id="cfg-selects"):
@@ -997,16 +1141,19 @@ class SettingsScreen(ModalScreen[bool]):
         self._atualizar_status_cookies()
 
     def _atualizar_status_cookies(self) -> None:
-        caminho = self.query_one("#cfg-cookies", Input).value.strip()
+        modo = str(self.query_one("#cfg-cookies-modo", Select).value)
+        campo = self.query_one("#cfg-cookies", Input)
         alvo = self.query_one("#cfg-cookies-status", Static)
-        if cookies_validos(caminho):
-            alvo.update(Text("Cookies válidos e ativos", style="green"))
-        elif caminho and Path(caminho).expanduser().exists():
-            alvo.update(Text("Arquivo não parece um cookies.txt (Netscape)", style="yellow"))
-        else:
-            alvo.update(Text("Cookies inativos (arquivo não encontrado)", style="dim"))
+        campo.display = modo == "arquivo"
+
+        if modo == "firefox":
+            alvo.update(Text("Usa a sessão do Firefox — nada para exportar", style="green"))
+            return
+        mensagem, estilo = resumo_cookies(campo.value.strip())
+        alvo.update(Text(mensagem, style=estilo))
 
     @on(Input.Changed, "#cfg-cookies")
+    @on(Select.Changed, "#cfg-cookies-modo")
     def _cookies_mudou(self) -> None:
         self._atualizar_status_cookies()
 
@@ -1017,6 +1164,7 @@ class SettingsScreen(ModalScreen[bool]):
         if pasta:
             cfg.base_dir = pasta
         cfg.cookies_file = self.query_one("#cfg-cookies", Input).value.strip()
+        cfg.cookies_modo = str(self.query_one("#cfg-cookies-modo", Select).value)
         cfg.max_concurrent = int(self.query_one("#cfg-simultaneos", Select).value)
         cfg.audio_quality = str(self.query_one("#cfg-audio", Select).value)
         cfg.embed_thumbnail = self.query_one("#cfg-thumb", Switch).value
@@ -1221,11 +1369,11 @@ class AVDownloaderApp(App):
     /* O corpo cresce com o conteúdo até um teto proporcional à tela: o modal
        fica compacto quando há pouca coisa e, quando há muita, rola por dentro
        em vez de empurrar os botões para fora (telas baixas, Termux). */
-    /* 40vh deixa folga para título, botões, padding e borda em qualquer
-       altura de terminal — inclusive 20 linhas. */
+    /* Com os botões ancorados no rodapé, o corpo pode ocupar o que sobra:
+       a caixa encolhe quando há pouco conteúdo e rola quando há muito. */
     .modal-corpo {
         height: auto;
-        max-height: 40vh;
+        max-height: 100%;
         scrollbar-size-vertical: 1;
     }
     .campo-label {
@@ -1233,6 +1381,7 @@ class AVDownloaderApp(App):
         margin-top: 1;
     }
     .botoes {
+        dock: bottom;
         height: 3;
         margin-top: 1;
         align-horizontal: right;
@@ -1380,7 +1529,12 @@ class AVDownloaderApp(App):
         erros = sum(1 for j in jobs if j.status is Status.ERROR)
         veloc_total = sum(j.speed or 0 for j in jobs if j.status is Status.DOWNLOADING)
 
-        cookies = "cookies ativos" if cookies_validos(self.config.cookies_file) else "cookies inativos"
+        if self.config.cookies_modo == "firefox" and cookies_no_navegador_disponivel():
+            cookies = "cookies: Firefox"
+        elif cookies_validos(self.config.cookies_file):
+            cookies = "cookies ativos"
+        else:
+            cookies = "cookies inativos"
         partes = [cookies, f"○ {fila}", f"↓ {baixando}", f"✓ {ok}", f"✗ {erros}"]
         if veloc_total:
             partes.append(human_speed(veloc_total))
@@ -1595,6 +1749,15 @@ class AVDownloaderApp(App):
             pass  # app encerrando
 
     def _download_worker(self, job: Job) -> None:
+        # 2ª tentativa (com cookies): serializada, um vídeo por vez — é o que
+        # permite ao yt-dlp regravar o cookies.txt em segurança. Não ocupa
+        # vaga na fila normal, então os demais downloads seguem em paralelo.
+        if job.usar_cookies:
+            self._set_status(job, Status.COOKIES)
+            with sessao_cookies(self.config) as cookies:
+                self._executar_download(job, cookies)
+            return
+
         # Espera por uma vaga (respeita mudanças de max_concurrent ao vivo)
         while True:
             if job.cancel.is_set():
@@ -1605,13 +1768,32 @@ class AVDownloaderApp(App):
                     self._ativos += 1
                     break
             time.sleep(0.3)
+        try:
+            self._executar_download(job, {})
+        finally:
+            with self._ativos_lock:
+                self._ativos -= 1
 
+    def _reenfileirar_com_cookies(self, job: Job) -> None:
+        job.usar_cookies = True
+        job.tentou_cookies = True
+        job.progress = 0.0
+        job.status = Status.COOKIES
+        self._refresh_row(job)
+        self.run_worker(
+            lambda j=job: self._download_worker(j),
+            thread=True,
+            group="downloads",
+            exclusive=False,
+        )
+
+    def _executar_download(self, job: Job, cookies: dict) -> None:
         try:
             if job.cancel.is_set():
                 self._set_status(job, Status.CANCELLED)
                 return
             Path(job.dest_dir).mkdir(parents=True, exist_ok=True)
-            self._set_status(job, Status.DOWNLOADING)
+            self._set_status(job, Status.COOKIES if cookies else Status.DOWNLOADING)
 
             def hook(d: dict) -> None:
                 if job.cancel.is_set():
@@ -1647,7 +1829,7 @@ class AVDownloaderApp(App):
                 if d.get("status") == "finished" and info.get("filepath"):
                     job.filepath = info["filepath"]
 
-            opts = build_ydl_opts(job, self.config, hook, pp_hook)
+            opts = build_ydl_opts(job, self.config, hook, pp_hook, cookies)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([job.url])
 
@@ -1658,6 +1840,19 @@ class AVDownloaderApp(App):
         except Exception as exc:
             if job.cancel.is_set():
                 self._set_status(job, Status.CANCELLED)
+            elif (
+                not cookies
+                and not job.tentou_cookies
+                and not (job.filepath and Path(job.filepath).exists())
+                and cookies_disponiveis(self.config)
+            ):
+                # Falhou sem cookies: pode ser conteúdo com login. Tenta de
+                # novo com cookies, na fila serializada.
+                job.error = str(exc)
+                try:
+                    self.call_from_thread(self._reenfileirar_com_cookies, job)
+                except Exception:
+                    self._set_status(job, Status.ERROR)
             elif job.filepath and Path(job.filepath).exists():
                 # Baixou, mas falhou em thumbnail/metadados
                 job.error = str(exc)
@@ -1674,9 +1869,6 @@ class AVDownloaderApp(App):
             else:
                 job.error = str(exc)
                 self._set_status(job, Status.ERROR)
-        finally:
-            with self._ativos_lock:
-                self._ativos -= 1
 
     def _registrar_historico(self, job: Job) -> None:
         tamanho = None
