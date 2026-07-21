@@ -47,7 +47,13 @@ vídeos & músicas · melhor qualidade sempre
 - **Temas** — o tema padrão `luna` segue a paleta dos meus programas
   (fundo `#0F0F0F` + azul `#019DEA`); alterne para tokyo-night, catppuccin,
   dracula, nord, gruvbox e outros com uma tecla.
-- **Cancelar e repetir** — cancele itens da fila e repita os que falharam.
+- **Repete sozinho o que falhou** — falhas passageiras (rede, servidor,
+  fragmento perdido) voltam para a fila automaticamente, até 3 tentativas,
+  com pausas crescentes. O que não adianta repetir (vídeo de membros,
+  privado, removido, bloqueado no país) para na primeira e mostra o motivo
+  na própria fila.
+- **Cancelar e repetir** — cancele itens da fila, repita um item (`r`) ou
+  todos os erros de uma vez (`R`).
 
 ## Instalação
 
@@ -107,6 +113,7 @@ av-downloader/
 | `v` | Colar URL da área de transferência |
 | `x` | Cancelar o item selecionado na fila |
 | `r` | Repetir item com erro ou cancelado |
+| `R` | Repetir todos os erros que valem a pena |
 | `l` | Limpar itens concluídos da fila |
 | `o` | Abrir a pasta de downloads |
 | `h` | Histórico de downloads |
@@ -201,6 +208,40 @@ falhar, não depois.
 > **Aviso:** usar a conta pessoal em automação tem risco (a própria wiki do
 > yt-dlp alerta para banimento temporário ou permanente). O recomendado é uma
 > conta secundária.
+
+### Quando um download falha
+
+Muita falha é passageira e some ao tentar de novo — é o que acontece quando
+você cola o link manualmente outra vez. O app faz isso sozinho: classifica o
+erro pela mensagem do yt-dlp e, se valer a pena, devolve o item à fila (até 3
+tentativas, esperando 5s, 20s e 60s). Enquanto isso o status mostra
+**"↻ Nova tentativa 2/3"**.
+
+Erros que **não** são repetidos, porque repetir não resolve — o motivo
+aparece no lugar do "Erro" na fila:
+
+| Motivo na fila | Quando acontece |
+|----------------|-----------------|
+| `Só p/ membros` | Vídeo exclusivo para membros do canal |
+| `Privado` | Vídeo privado |
+| `Removido` / `Indisponível` | Apagado ou fora do ar |
+| `Bloqueado no país` | Restrição regional |
+| `Restrito por idade` | Exige login verificado (já tentou com cookies) |
+| `Limite do YouTube` | Rate limit — espere e use `R` mais tarde |
+| `Direitos autorais` | Bloqueado por copyright |
+
+A tecla **`R`** recoloca de uma vez todos os erros que valem a pena, deixando
+de fora os que não têm jeito (e avisando quantos foram ignorados).
+
+## Testes
+
+```sh
+venv/bin/python testes.py          # tudo (inclui consultas reais ao YouTube)
+venv/bin/python testes.py rapidos  # só os que não usam internet
+```
+
+Os testes rodam com um `HOME` temporário — não tocam na sua configuração nem
+nos seus downloads.
 
 ## Arquivos
 

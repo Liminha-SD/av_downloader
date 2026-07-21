@@ -573,6 +573,70 @@ class JobCancelled(Exception):
     pass
 
 
+# ── Classificação de erros ────────────────────────────────────────
+#
+# Boa parte das falhas é passageira (rede, limite momentâneo, fragmento
+# perdido) e some ao tentar de novo — é o que acontece quando se cola o link
+# manualmente outra vez. Outras não adiantam repetir: vídeo de membros,
+# privado, removido ou bloqueado no país. Só as primeiras são reagendadas.
+
+MAX_TENTATIVAS = 3
+ESPERA_TENTATIVA = (5, 20, 60)  # segundos entre tentativas
+
+_ERROS_DEFINITIVOS: list[tuple[str, str]] = [
+    ("join this channel", "Só p/ membros"),
+    ("members-only", "Só p/ membros"),
+    ("members only", "Só p/ membros"),
+    ("private video", "Privado"),
+    ("this video is private", "Privado"),
+    ("video unavailable", "Indisponível"),
+    ("has been removed", "Removido"),
+    ("removed by the uploader", "Removido"),
+    ("account associated with this video has been terminated", "Canal encerrado"),
+    ("not made this video available in your country", "Bloqueado no país"),
+    ("blocked it on copyright grounds", "Direitos autorais"),
+    ("who has blocked it", "Direitos autorais"),
+    ("this video may be inappropriate", "Restrito por idade"),
+    ("confirm your age", "Restrito por idade"),
+    ("sign in to confirm your age", "Restrito por idade"),
+    ("is not available in your country", "Bloqueado no país"),
+    ("premium", "Só p/ assinantes"),
+    ("purchase", "Precisa comprar"),
+    ("drm", "Protegido (DRM)"),
+]
+
+# Vale repetir, mas não agora: o próprio YouTube diz para esperar
+_ERROS_ESPERAR: list[tuple[str, str]] = [
+    ("rate-limited", "Limite do YouTube"),
+    ("try again later", "Limite do YouTube"),
+    ("too many requests", "Limite do YouTube"),
+    ("not a bot", "Bloqueio antirrobô"),
+    ("captcha", "Bloqueio antirrobô"),
+]
+
+
+def classificar_erro(mensagem: str) -> tuple[bool, str]:
+    """(vale repetir?, motivo curto) a partir da mensagem do yt-dlp."""
+    texto = (mensagem or "").lower()
+    for marca, rotulo in _ERROS_DEFINITIVOS:
+        if marca in texto:
+            return False, rotulo
+    for marca, rotulo in _ERROS_ESPERAR:
+        if marca in texto:
+            return False, rotulo
+    if "no address associated" in texto or "unable to download webpage" in texto:
+        return True, "Sem conexão"
+    if "timed out" in texto or "timeout" in texto:
+        return True, "Tempo esgotado"
+    if "connection" in texto or "network" in texto or "temporary failure" in texto:
+        return True, "Falha de rede"
+    if "http error 5" in texto or "server" in texto:
+        return True, "Erro do servidor"
+    if "fragment" in texto:
+        return True, "Fragmento perdido"
+    return True, "Falhou"  # desconhecido: vale a pena repetir
+
+
 class Status:
     QUEUED = ("○", "Na fila", "dim")
     DOWNLOADING = ("↓", "Baixando", "bold #019DEA")
@@ -580,12 +644,13 @@ class Status:
     CONVERTING = ("~", "Processando", "bold yellow")
     DONE = ("✓", "Concluído", "bold green")
     WARN = ("✓", "Concluído*", "yellow")
+    RETRY = ("↻", "Nova tentativa", "yellow")
     ERROR = ("✗", "Erro", "bold red")
     CANCELLED = ("⊘", "Cancelado", "dim")
     IGNORED = ("⊘", "Live ignorada", "dim")
 
     FINAIS = (DONE, WARN, ERROR, CANCELLED, IGNORED)
-    ATIVOS = (QUEUED, DOWNLOADING, COOKIES, CONVERTING)
+    ATIVOS = (QUEUED, DOWNLOADING, COOKIES, CONVERTING, RETRY)
 
 
 _job_ids = itertools.count(1)
@@ -602,6 +667,8 @@ class Job:
     bloquear_live: bool = False
     usar_cookies: bool = False
     tentou_cookies: bool = False
+    tentativas: int = 0
+    motivo: str = ""
     id: int = field(default_factory=lambda: next(_job_ids))
     status: tuple = Status.QUEUED
     progress: float = 0.0
@@ -1332,6 +1399,7 @@ class HelpScreen(ModalScreen[None]):
         ("v", "Colar URL da área de transferência"),
         ("x", "Cancelar o item selecionado na fila"),
         ("r", "Repetir item com erro ou cancelado"),
+        ("R", "Repetir todos os erros que valem a pena"),
         ("l", "Limpar itens concluídos da fila"),
         ("o", "Abrir a pasta de downloads"),
         ("h", "Histórico de downloads"),
@@ -1381,6 +1449,7 @@ class AVDownloaderApp(App):
         Binding("escape", "focar_fila", "Atalhos"),
         Binding("f1", "ajuda", "Ajuda", show=False),
         Binding("r", "repetir_item", "Repetir item", show=False),
+        Binding("R", "repetir_erros", "Repetir todos os erros", show=False),
         Binding("l", "limpar_concluidos", "Limpar concluídos", show=False),
         Binding("o", "abrir_pasta", "Abrir pasta", show=False),
         Binding("t", "alternar_tema", "Tema", show=False),
@@ -1799,6 +1868,10 @@ class AVDownloaderApp(App):
     @staticmethod
     def _celula_status(job: Job) -> Text:
         icone, rotulo, estilo = job.status
+        if job.status is Status.ERROR and job.motivo:
+            rotulo = job.motivo  # diz por que falhou, não só "Erro"
+        elif job.status is Status.RETRY and job.tentativas:
+            rotulo = f"{rotulo} {job.tentativas}/{MAX_TENTATIVAS}"
         return Text(f"{icone} {rotulo}", style=estilo)
 
     def _refresh_row(self, job: Job) -> None:
@@ -1952,7 +2025,40 @@ class AVDownloaderApp(App):
                     pass
             else:
                 job.error = str(exc)
+                vale_repetir, motivo = classificar_erro(job.error)
+                job.motivo = motivo
+                if vale_repetir and job.tentativas < MAX_TENTATIVAS:
+                    # Recoloca o link na fila — muitas falhas somem sozinhas
+                    espera = ESPERA_TENTATIVA[min(job.tentativas, len(ESPERA_TENTATIVA) - 1)]
+                    job.tentativas += 1
+                    try:
+                        self.call_from_thread(self._reagendar, job, espera)
+                        return
+                    except Exception:
+                        pass
                 self._set_status(job, Status.ERROR)
+
+    def _reagendar(self, job: Job, espera: float) -> None:
+        """Devolve o item à fila depois de uma pausa."""
+        job.status = Status.RETRY
+        job.progress = 0.0
+        job.speed = None
+        job.eta = None
+        self._refresh_row(job)
+        self._atualizar_stats()
+
+        def voltar() -> None:
+            if job.cancel.is_set() or job.status is not Status.RETRY:
+                return
+            job.usar_cookies = False  # recomeça pelo caminho rápido
+            self.run_worker(
+                lambda j=job: self._download_worker(j),
+                thread=True,
+                group="downloads",
+                exclusive=False,
+            )
+
+        self.set_timer(espera, voltar)
 
     def _registrar_historico(self, job: Job) -> None:
         tamanho = None
@@ -2026,15 +2132,24 @@ class AVDownloaderApp(App):
         if job is None:
             self.notify("Nenhum item selecionado na fila.", severity="warning")
             return
-        if job.status not in (Status.ERROR, Status.CANCELLED):
+        if job.status not in (Status.ERROR, Status.CANCELLED, Status.IGNORED):
             self.notify("Só é possível repetir itens com erro ou cancelados.", severity="warning")
             return
+        self._recolocar(job)
+        self.notify("Item recolocado na fila.")
+
+    def _recolocar(self, job: Job) -> None:
+        """Zera o item e o devolve à fila (tentativas incluídas)."""
         job.cancel = threading.Event()
         job.status = Status.QUEUED
         job.progress = 0.0
         job.speed = None
         job.eta = None
         job.error = ""
+        job.motivo = ""
+        job.tentativas = 0
+        job.usar_cookies = False
+        job.tentou_cookies = False
         self._refresh_row(job)
         self.run_worker(
             lambda j=job: self._download_worker(j),
@@ -2042,7 +2157,33 @@ class AVDownloaderApp(App):
             group="downloads",
             exclusive=False,
         )
-        self.notify("Item recolocado na fila.")
+
+    def action_repetir_erros(self) -> None:
+        """Recoloca de uma vez tudo que falhou — menos o que não adianta."""
+        repetiveis = [
+            j for j in self.jobs.values()
+            if j.status is Status.ERROR and classificar_erro(j.error)[0]
+        ]
+        sem_jeito = sum(
+            1 for j in self.jobs.values()
+            if j.status is Status.ERROR and not classificar_erro(j.error)[0]
+        )
+        if not repetiveis:
+            if sem_jeito:
+                self.notify(
+                    f"Os {sem_jeito} erros restantes não adiantam repetir "
+                    "(membros, privado, removido…).",
+                    severity="warning",
+                )
+            else:
+                self.notify("Nenhum erro na fila.")
+            return
+        for job in repetiveis:
+            self._recolocar(job)
+        recado = f"{len(repetiveis)} itens de volta à fila."
+        if sem_jeito:
+            recado += f" {sem_jeito} sem jeito ficaram de fora."
+        self.notify(recado)
 
     def action_limpar_concluidos(self) -> None:
         tabela = self.query_one("#queue", DataTable)
