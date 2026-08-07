@@ -109,7 +109,14 @@ LUNA_THEME = Theme(
     dark=True,
 )
 
+# Tamanho do lote: a fila nunca recebe mais que isso de uma vez. Quando os
+# primeiros itens já estão na pasta, o app avança para as páginas seguintes
+# até juntar um lote do que falta (ou esgotar a lista/o teto de páginas).
 MAX_PLAYLIST_ITEMS = 500
+MAX_PAGINAS = 20
+# Cada página seguinte custa mais que a anterior (o yt-dlp precisa percorrer
+# a lista até o ponto pedido), então há também um teto de tempo.
+LIMITE_BUSCA_S = 180
 
 # Shorts têm no máximo 3 minutos: acima disso não há o que checar.
 SHORTS_MAX_DURACAO = 180
@@ -547,9 +554,14 @@ def _estado_da_pasta(pasta: Path | str, fmt: str) -> tuple[set[str], set[str]]:
     return chaves, nomes
 
 
-def separar_baixados(entries: list[dict], pasta: Path | str, fmt: str) -> tuple[list[dict], list[dict]]:
-    """Divide as entradas em (ainda não baixadas, já baixadas)."""
-    chaves, nomes = _estado_da_pasta(pasta, fmt)
+def separar_baixados(entries: list[dict], pasta: Path | str, fmt: str,
+                     estado: tuple[set[str], set[str]] | None = None) -> tuple[list[dict], list[dict]]:
+    """Divide as entradas em (ainda não baixadas, já baixadas).
+
+    `estado` evita reler a pasta a cada página quando se percorre uma lista
+    longa (ver coletar_lote).
+    """
+    chaves, nomes = estado if estado is not None else _estado_da_pasta(pasta, fmt)
     if not chaves and not nomes:
         return list(entries), []
 
@@ -800,14 +812,17 @@ def sessao_cookies(cfg: Config):
             _restaurar_cookies(cfg)
 
 
-def fetch_info(url: str, cfg: Config, usar_cookies: bool = False) -> dict:
-    """Extrai metadados sem baixar (playlists de forma achatada)."""
+def fetch_info(url: str, cfg: Config, usar_cookies: bool = False, inicio: int = 1) -> dict:
+    """Extrai metadados sem baixar (playlists de forma achatada).
+
+    `inicio` é a posição do primeiro item da página (1, 501, 1001…).
+    """
     opts: dict = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "extract_flat": "in_playlist",
-        "playlist_items": f"1-{MAX_PLAYLIST_ITEMS}",
+        "playlist_items": f"{inicio}-{inicio + MAX_PLAYLIST_ITEMS - 1}",
         "socket_timeout": 20,
     }
     if not usar_cookies:
@@ -891,29 +906,121 @@ def fonte_de_lives(url: str) -> bool:
     return fim.endswith("/streams") or fim.endswith("/live")
 
 
+def abas_uteis(summary: dict, ignorar_shorts: bool,
+               ignorar_lives: bool) -> tuple[list[str], bool]:
+    """URLs das abas do canal que devem ser percorridas, e se a aba de lives
+    ficou de fora."""
+    urls: list[str] = []
+    lives_ignoradas = False
+    for aba in summary["tabs"]:
+        titulo = aba["title"].rstrip().lower()
+        if ignorar_shorts and titulo.endswith("shorts"):
+            continue
+        # A aba "Live" reúne transmissões e suas gravações; a aba "Videos"
+        # já não traz nada disso.
+        if ignorar_lives and (titulo.endswith("live") or titulo.endswith("streams")):
+            lives_ignoradas = True
+            continue
+        urls.append(aba["url"])
+    return urls, lives_ignoradas
+
+
+def _pagina(fonte: str, cfg: Config, inicio: int, usar_cookies: bool) -> list[dict] | None:
+    """Uma página de uma lista. None quando a fonte não pôde ser lida."""
+    try:
+        resumo = resumir_info(fonte, fetch_info(fonte, cfg, usar_cookies, inicio))
+    except Exception:
+        if usar_cookies or not cookies_disponiveis(cfg):
+            return None
+        try:  # pode ser lista que exige login
+            resumo = resumir_info(fonte, fetch_info(fonte, cfg, True, inicio))
+        except Exception:
+            return None
+    return resumo.get("entries") or [] if resumo["kind"] == "playlist" else []
+
+
+def coletar_lote(fontes: list[str], cfg: Config, fmt: str, pasta: Path | str, *,
+                 ignorar_shorts: bool, ignorar_lives: bool,
+                 primeira_pagina: list[dict] | None = None,
+                 progresso=None, cancelado=None) -> dict:
+    """Junta até MAX_PLAYLIST_ITEMS itens que ainda faltam baixar.
+
+    Avança de página em página: se os primeiros 500 já estão na pasta, busca
+    os 500 seguintes, e assim por diante — sem nunca devolver uma pilha maior
+    que um lote.
+    """
+    estado = _estado_da_pasta(pasta, fmt)  # lê a pasta uma vez só
+    novos: list[dict] = []
+    vistos = ja_total = shorts_total = lives_total = 0
+    mais = False
+    limite = time.monotonic() + LIMITE_BUSCA_S
+
+    for indice, fonte in enumerate(fontes):
+        pagina = 0
+        while pagina < MAX_PAGINAS:
+            if pagina and time.monotonic() > limite:
+                mais = True  # demorou demais: entrega o que já achou
+                break
+            if cancelado and cancelado():
+                return {"entries": novos[:MAX_PLAYLIST_ITEMS], "vistos": vistos,
+                        "ja_baixados": ja_total, "shorts_ignorados": shorts_total,
+                        "lives_ignoradas": lives_total, "mais": True}
+
+            if indice == 0 and pagina == 0 and primeira_pagina is not None:
+                brutas = primeira_pagina  # página já obtida na análise inicial
+            else:
+                if progresso:
+                    progresso(vistos, len(novos))
+                brutas = _pagina(fonte, cfg, pagina * MAX_PLAYLIST_ITEMS + 1, False)
+                if brutas is None:
+                    break  # fonte indisponível não invalida as demais
+            pagina += 1
+            if not brutas:
+                break
+            vistos += len(brutas)
+            fim_da_fonte = len(brutas) < MAX_PLAYLIST_ITEMS
+
+            restantes = brutas
+            if ignorar_lives:
+                restantes, lives = separar_lives(restantes)
+                lives_total += len(lives)
+            # Disco antes da rede: não paga checagem de Short no que já temos
+            restantes, ja = separar_baixados(restantes, pasta, fmt, estado)
+            ja_total += len(ja)
+            if ignorar_shorts and restantes:
+                if progresso:
+                    progresso(vistos, len(novos))
+                restantes, shorts = separar_shorts(restantes)
+                shorts_total += len(shorts)
+            novos.extend(restantes)
+
+            if len(novos) >= MAX_PLAYLIST_ITEMS:
+                mais = not (fim_da_fonte and indice == len(fontes) - 1)
+                break
+            if fim_da_fonte:
+                break
+        else:
+            mais = True  # teto de páginas: pode haver mais adiante
+
+        if len(novos) >= MAX_PLAYLIST_ITEMS:
+            break
+
+    if len(novos) > MAX_PLAYLIST_ITEMS:
+        novos = novos[:MAX_PLAYLIST_ITEMS]
+        mais = True
+
+    return {"entries": novos, "vistos": vistos, "ja_baixados": ja_total,
+            "shorts_ignorados": shorts_total, "lives_ignoradas": lives_total,
+            "mais": mais}
+
+
 def expandir_canal(summary: dict, cfg: Config, ignorar_shorts: bool,
                    ignorar_lives: bool = False) -> dict:
     """Converte um canal (lista de abas) na lista de vídeos das suas abas."""
     entries: list[dict] = []
-    lives_ignoradas = False
-    for aba in summary["tabs"]:
-        titulo_aba = aba["title"].rstrip().lower()
-        if ignorar_shorts and titulo_aba.endswith("shorts"):
-            continue
-        # A aba "Live" reúne transmissões e suas gravações; a aba "Videos"
-        # já não traz nada disso.
-        if ignorar_lives and (titulo_aba.endswith("live") or titulo_aba.endswith("streams")):
-            lives_ignoradas = True
-            continue
-        try:
-            resumo_aba = resumir_info(aba["url"], fetch_info(aba["url"], cfg))
-        except Exception:
-            try:  # pode ser aba que exige login
-                resumo_aba = resumir_info(aba["url"], fetch_info(aba["url"], cfg, usar_cookies=True))
-            except Exception:
-                continue  # aba indisponível não invalida o resto do canal
-        if resumo_aba["kind"] == "playlist":
-            entries.extend(resumo_aba["entries"])
+    urls, lives_ignoradas = abas_uteis(summary, ignorar_shorts, ignorar_lives)
+    for url_aba in urls:
+        entries.extend(_pagina(url_aba, cfg, 1, False) or [])
 
     return {
         "kind": "playlist",
@@ -976,6 +1083,7 @@ class AddDownloadScreen(ModalScreen[dict | None]):
         self._summary: dict | None = None
         self._novos: list[dict] = []
         self._ja_baixado = False
+        self._cancelado = False
 
     def compose(self) -> ComposeResult:
         with Container(classes="modal caixa-add"):
@@ -1031,39 +1139,64 @@ class AddDownloadScreen(ModalScreen[dict | None]):
             self.app.call_from_thread(self._status_analise, "Tentando com cookies…")
             return resumir_info(self._url, fetch_info(self._url, self._cfg, usar_cookies=True))
 
-    def _fetch(self) -> None:
+    def _fetch(self, fmt: str = "video:best") -> None:
         try:
             summary = self._analisar()
 
-            # Shorts só entram quando pedidos explicitamente (link de Short
-            # ou aba /shorts) — nunca junto de uma playlist ou canal.
+            # Shorts e lives só entram quando pedidos explicitamente (link do
+            # Short/live ou aba /shorts, /streams) — nunca junto de uma
+            # playlist ou canal.
             ignorar = self._cfg.ignorar_shorts and not fonte_de_shorts(self._url)
-
             ignorar_lives = self._cfg.ignorar_lives and not fonte_de_lives(self._url)
+
+            if summary["kind"] == "single":
+                self.app.call_from_thread(self._mostrar_info, summary)
+                return
 
             if summary["kind"] == "canal":
                 self.app.call_from_thread(self._status_analise, "Listando vídeos do canal…")
-                summary = expandir_canal(summary, self._cfg, ignorar, ignorar_lives)
+                fontes, aba_lives = abas_uteis(summary, ignorar, ignorar_lives)
+                base = {
+                    "kind": "playlist", "url": summary["url"], "site": summary["site"],
+                    "title": summary["title"], "uploader": summary["uploader"],
+                    "aba_shorts_ignorada": ignorar, "aba_lives_ignorada": aba_lives,
+                }
+                primeira = None
+                # A aba Videos já exclui Shorts: não vale pagar a checagem
+                checar_shorts = False
+            else:
+                base = {**summary, "aba_shorts_ignorada": False, "aba_lives_ignorada": False}
+                fontes = [self._url]
+                primeira = summary["entries"]
+                checar_shorts = ignorar
 
-            if ignorar_lives and summary["kind"] == "playlist" and not summary.get("aba_lives_ignorada"):
-                videos, lives = separar_lives(summary["entries"])
-                summary["entries"] = videos
-                summary["lives_ignoradas"] = len(lives)
-
-            if ignorar and summary["kind"] == "playlist" and not summary.get("aba_shorts_ignorada"):
-                def aviso(quantos: int) -> None:
+            def progresso(vistos: int, achados: int) -> None:
+                if vistos:
                     self.app.call_from_thread(
-                        self._status_analise, f"Identificando Shorts ({quantos} a checar)…"
+                        self._status_analise,
+                        f"Procurando o que falta… {vistos} vistos, {achados} novos",
                     )
 
-                videos, shorts = separar_shorts(summary["entries"], progresso=aviso)
-                summary["entries"] = videos
-                summary["shorts_ignorados"] = len(shorts)
+            lote = coletar_lote(
+                fontes, self._cfg, fmt, pasta_destino(base, fmt, self._cfg),
+                ignorar_shorts=checar_shorts, ignorar_lives=ignorar_lives,
+                primeira_pagina=primeira, progresso=progresso,
+                cancelado=lambda: self._cancelado,
+            )
+            base.update({
+                "entries": lote["entries"],
+                "vistos": lote["vistos"],
+                "ja_baixados": lote["ja_baixados"],
+                "shorts_ignorados": lote["shorts_ignorados"],
+                "lives_ignoradas": lote["lives_ignoradas"],
+                "mais": lote["mais"],
+                "fmt_coletado": fmt,
+            })
         except Exception as exc:  # rede, URL inválida, bloqueio do site…
             msg = str(exc)
             self.app.call_from_thread(self._mostrar_erro, msg)
             return
-        self.app.call_from_thread(self._mostrar_info, summary)
+        self.app.call_from_thread(self._mostrar_info, base)
 
     def _status_analise(self, texto: str) -> None:
         try:
@@ -1101,8 +1234,28 @@ class AddDownloadScreen(ModalScreen[dict | None]):
 
     @on(Select.Changed, "#add-fmt")
     def _formato_mudou(self) -> None:
-        if self._summary is not None:
-            self._render_info()
+        summary = self._summary
+        if summary is None:
+            return
+        fmt = str(self.query_one("#add-fmt", Select).value)
+        if summary["kind"] == "playlist" and fmt != summary.get("fmt_coletado"):
+            # O que já está na pasta muda com o formato — e com ele, quantas
+            # páginas é preciso avançar para encher o lote.
+            if summary.get("mais") or summary.get("ja_baixados"):
+                self._recoletar(fmt)
+                return
+            summary["fmt_coletado"] = fmt
+        self._render_info()
+
+    def _recoletar(self, fmt: str) -> None:
+        """Refaz a busca do lote para o formato recém-escolhido."""
+        try:
+            self.query_one("#add-loading").display = True
+            self.query_one("#btn-ok", Button).disabled = True
+            self._status_analise("Refazendo a busca para o novo formato…")
+        except Exception:
+            return
+        self.run_worker(lambda: self._fetch(fmt), thread=True, exclusive=True)
 
     def _render_info(self) -> None:
         """Monta o painel — o que já foi baixado depende do formato escolhido."""
@@ -1121,17 +1274,23 @@ class AddDownloadScreen(ModalScreen[dict | None]):
         texto.append(f"{summary['site']}\n")
 
         if summary["kind"] == "playlist":
-            self._novos, ja_baixados = separar_baixados(summary["entries"], pasta, fmt)
-            total = len(summary["entries"])
+            # A busca já entregou só o que falta (ver coletar_lote)
+            self._novos = summary.get("entries") or []
+            vistos = summary.get("vistos", len(self._novos))
+            ja_baixados = summary.get("ja_baixados", 0)
             texto.append("Itens    ", "bold")
             texto.append(f"{len(self._novos)}", "bold magenta")
             texto.append(" novos", "bold magenta")
-            texto.append(f" de {total}")
-            if total >= MAX_PLAYLIST_ITEMS:
-                texto.append(f" (limitado a {MAX_PLAYLIST_ITEMS})", "dim")
+            if vistos > len(self._novos):
+                texto.append(f" de {vistos} vistos")
+            if summary.get("mais"):
+                texto.append(
+                    f"\n         lote de {MAX_PLAYLIST_ITEMS} — repita o link depois "
+                    "para continuar", "dim",
+                )
             if ja_baixados:
                 texto.append("\nJá tenho ", "bold")
-                texto.append(f"{len(ja_baixados)} — serão pulados", "green")
+                texto.append(f"{ja_baixados} — pulados", "green")
             ignorados = summary.get("shorts_ignorados") or 0
             if ignorados or summary.get("aba_shorts_ignorada"):
                 texto.append("\nShorts   ", "bold")
@@ -1208,9 +1367,11 @@ class AddDownloadScreen(ModalScreen[dict | None]):
 
     @on(Button.Pressed, "#btn-cancelar")
     def _cancelar(self) -> None:
+        self._cancelado = True
         self.dismiss(None)
 
     def action_fechar(self) -> None:
+        self._cancelado = True
         self.dismiss(None)
 
 

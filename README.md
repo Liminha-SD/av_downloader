@@ -31,6 +31,10 @@ vídeos & músicas · melhor qualidade sempre
 - **Não baixa o que você já tem** — antes de montar a fila, o app lê a pasta
   de destino e pula o que já está lá (mostra "440 novos de 445"). Vale para
   arquivos baixados por versões anteriores e pelo script antigo.
+- **Lotes de 500, com continuação** — a fila recebe no máximo 500 itens por
+  vez. Se os primeiros 500 já estiverem na pasta, o app avança para os 500
+  seguintes do canal, e assim por diante — cole o link de novo depois para
+  continuar de onde parou.
 - **Qualidade sob controle** — melhor qualidade (vídeo+áudio mesclados) ou
   limite de 1080p/720p/480p/360p.
 - **Conversão para MP3** — 128 a 320 kbps, com thumbnail e metadados
@@ -161,6 +165,21 @@ A verificação é feita **na própria pasta de destino**, combinando duas fonte
    ID de cada vídeo baixado. Como acompanha a pasta, sobrevive a
    reinstalações; e como é por ID, continua valendo se o autor renomear o
    vídeo no YouTube (algo comum — canais testam títulos o tempo todo).
+
+### Canais grandes: lotes de 500
+
+Um canal com milhares de vídeos não vira uma fila de milhares de itens. O app
+trabalha em **lotes de 500**: percorre a lista de 500 em 500, descartando o
+que já está na pasta, até juntar 500 itens que ainda faltam (ou até a lista
+acabar). Se sobrou coisa, o painel avisa — *"lote de 500 — repita o link
+depois para continuar"* — e basta colar o link outra vez para pegar os
+próximos 500.
+
+Durante a busca o painel mostra o progresso (*"Procurando o que falta… 1500
+vistos, 500 novos"*). Cada página seguinte custa mais tempo que a anterior
+(o yt-dlp precisa percorrer a lista até o ponto pedido), então a procura para
+sozinha após 20 páginas ou 3 minutos, entregando o que já encontrou. `Esc`
+cancela a qualquer momento.
 
 Regras que valem a pena saber:
 

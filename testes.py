@@ -185,6 +185,185 @@ def t_baixados():
 
 
 # ══════════════════════════════════════════════════════════════════
+# Paginação (lotes de 500)
+# ══════════════════════════════════════════════════════════════════
+
+def _catalogo(total: int, live: bool = False):
+    """Substitui fetch_info por uma lista sintética de `total` itens."""
+    def fake(url, cfg, usar_cookies=False, inicio=1):
+        fim = min(inicio + m.MAX_PLAYLIST_ITEMS - 1, total)
+        entradas = [
+            {"_type": "url", "id": f"v{n}", "title": f"Vídeo {n}",
+             "url": f"https://www.youtube.com/watch?v=v{n}",
+             "duration": 600,  # acima do limite de Short: resolve sem rede
+             "live_status": "was_live" if live else None}
+            for n in range(inicio, fim + 1)
+        ]
+        return {"_type": "playlist", "title": "Lista", "channel": "Canal", "entries": entradas}
+    return fake
+
+
+def _marcar_baixados(pasta: Path, quantos: int, de: int = 1) -> None:
+    pasta.mkdir(parents=True, exist_ok=True)
+    for n in range(de, de + quantos):
+        (pasta / f"Vídeo {n} [1920x1080].mkv").write_text("x")
+
+
+def _coletar(url="https://www.youtube.com/playlist?list=PL1", **kwargs):
+    return m.coletar_lote([url], _cfg(), kwargs.pop("fmt", "video:best"),
+                          kwargs.pop("pasta"), ignorar_shorts=kwargs.pop("ignorar_shorts", True),
+                          ignorar_lives=kwargs.pop("ignorar_lives", True), **kwargs)
+
+
+@teste("paginação: intervalo pedido ao yt-dlp")
+def t_pagina_intervalo():
+    capturado = {}
+
+    class Espiao:
+        def __init__(self, opts):
+            capturado.update(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {}
+
+    real = m.yt_dlp.YoutubeDL
+    m.yt_dlp.YoutubeDL = Espiao
+    try:
+        m.fetch_info("u", _cfg())
+        assert capturado["playlist_items"] == "1-500", capturado["playlist_items"]
+        m.fetch_info("u", _cfg(), inicio=501)
+        assert capturado["playlist_items"] == "501-1000", capturado["playlist_items"]
+        m.fetch_info("u", _cfg(), inicio=1001)
+        assert capturado["playlist_items"] == "1001-1500", capturado["playlist_items"]
+    finally:
+        m.yt_dlp.YoutubeDL = real
+
+
+@teste("paginação: página 1 toda baixada -> traz a próxima")
+def t_paginacao_avanca():
+    pasta = _TMP / "pag_avanca"
+    shutil.rmtree(pasta, ignore_errors=True)
+    _marcar_baixados(pasta, 500)  # itens 1..500 já na pasta
+    real = m.fetch_info
+    m.fetch_info = _catalogo(1200)
+    try:
+        lote = _coletar(pasta=pasta)
+    finally:
+        m.fetch_info = real
+    ids = [e["id"] for e in lote["entries"]]
+    assert len(ids) == 500, len(ids)
+    assert ids[0] == "v501" and ids[-1] == "v1000", (ids[0], ids[-1])
+    assert lote["ja_baixados"] == 500, lote["ja_baixados"]
+    assert lote["vistos"] == 1000, lote["vistos"]
+    assert lote["mais"] is True
+
+
+@teste("paginação: nunca entrega mais que um lote")
+def t_paginacao_teto():
+    pasta = _TMP / "pag_teto"
+    shutil.rmtree(pasta, ignore_errors=True)
+    pasta.mkdir(parents=True)
+    real = m.fetch_info
+    m.fetch_info = _catalogo(5000)
+    try:
+        lote = _coletar(pasta=pasta)
+    finally:
+        m.fetch_info = real
+    assert len(lote["entries"]) == m.MAX_PLAYLIST_ITEMS
+    assert lote["vistos"] == 500, "não devia buscar página extra sem precisar"
+    assert lote["mais"] is True
+
+
+@teste("paginação: lista curta termina sem sobra")
+def t_paginacao_fim():
+    pasta = _TMP / "pag_fim"
+    shutil.rmtree(pasta, ignore_errors=True)
+    _marcar_baixados(pasta, 700)  # sobram 500 exatos (701..1200)
+    real = m.fetch_info
+    m.fetch_info = _catalogo(1200)
+    try:
+        lote = _coletar(pasta=pasta)
+    finally:
+        m.fetch_info = real
+    ids = [e["id"] for e in lote["entries"]]
+    assert len(ids) == 500 and ids[0] == "v701" and ids[-1] == "v1200", (len(ids), ids[0], ids[-1])
+    assert lote["mais"] is False, "não há mais nada além do fim da lista"
+
+    # lista menor que uma página
+    pasta2 = _TMP / "pag_curta"
+    shutil.rmtree(pasta2, ignore_errors=True)
+    pasta2.mkdir(parents=True)
+    m.fetch_info = _catalogo(300)
+    try:
+        lote = _coletar(pasta=pasta2)
+    finally:
+        m.fetch_info = real
+    assert len(lote["entries"]) == 300 and lote["mais"] is False
+
+
+@teste("paginação: teto de páginas e cancelamento")
+def t_paginacao_limites():
+    pasta = _TMP / "pag_limite"
+    shutil.rmtree(pasta, ignore_errors=True)
+    pasta.mkdir(parents=True)
+    real = m.fetch_info
+    m.fetch_info = _catalogo(500 * (m.MAX_PAGINAS + 5), live=True)  # nada aproveitável
+    try:
+        lote = _coletar(pasta=pasta)
+        assert not lote["entries"]
+        assert lote["vistos"] == 500 * m.MAX_PAGINAS, lote["vistos"]
+        assert lote["mais"] is True
+
+        paginas = {"n": 0}
+
+        def parar():
+            paginas["n"] += 1
+            return paginas["n"] > 3
+
+        lote = _coletar(pasta=pasta, cancelado=parar)
+        assert lote["vistos"] <= 500 * 4, lote["vistos"]
+        assert lote["mais"] is True
+    finally:
+        m.fetch_info = real
+
+
+@teste("paginação: canal real avança para a 2ª página", rede=True)
+def t_paginacao_rede():
+    from yt_dlp.utils import sanitize_filename
+    cfg = _cfg()
+    aba = "https://www.youtube.com/@SkyNews/videos"
+    pagina1 = m._pagina(aba, cfg, 1, False)
+    assert pagina1 and len(pagina1) == m.MAX_PLAYLIST_ITEMS, len(pagina1 or [])
+
+    pasta = _TMP / "pag_rede"
+    shutil.rmtree(pasta, ignore_errors=True)
+    pasta.mkdir(parents=True)
+    # Finge que a 1ª página inteira já foi baixada — com arquivo E registro,
+    # como o app faz. O registro por ID é essencial aqui: canais de notícias
+    # editam títulos o tempo todo (medido: 39 mudanças em 500 num minuto), e
+    # só o casamento por nome deixaria itens escaparem.
+    for item in pagina1:
+        arquivo = pasta / f"{sanitize_filename(item['title'])} [1920x1080].mkv"
+        arquivo.write_text("x")
+        m.registrar_baixado(pasta, item["id"], "video:best", str(arquivo), item["title"])
+
+    lote = m.coletar_lote([aba], cfg, "video:best", pasta,
+                          ignorar_shorts=False, ignorar_lives=True)
+    # Tolerância: vídeos publicados entre as duas leituras entram no topo
+    assert lote["ja_baixados"] >= len(pagina1) * 0.95, lote["ja_baixados"]
+    assert lote["vistos"] > m.MAX_PLAYLIST_ITEMS, "não avançou de página"
+    assert lote["entries"], "deveria ter trazido itens da página seguinte"
+    ids_pagina1 = {e["id"] for e in pagina1}
+    assert not ids_pagina1 & {e["id"] for e in lote["entries"]}, "repetiu itens da 1ª página"
+
+
+# ══════════════════════════════════════════════════════════════════
 # Cookies
 # ══════════════════════════════════════════════════════════════════
 
