@@ -333,6 +333,150 @@ def t_paginacao_limites():
         m.fetch_info = real
 
 
+async def _modal_playlist(app, url="https://www.youtube.com/playlist?list=PL1"):
+    """Abre o modal e espera a análise terminar. Devolve a tela."""
+    app.query_one("#url-input").value = url
+    await app._pilot_atual.press("enter")
+    await app._pilot_atual.pause()
+    tela = app.screen
+    inicio = time.monotonic()
+    while tela.query_one("#btn-ok").disabled:
+        if time.monotonic() - inicio > 60:
+            raise TimeoutError("análise não terminou")
+        await app._pilot_atual.pause(0.2)
+    return tela
+
+
+@teste("formato: trocar de formato reconfere a pasta")
+def t_troca_formato():
+    async def fluxo():
+        app = AVDownloaderApp()
+        app.config.auto_update = False
+        app.config.base_dir = str(_TMP / "troca")
+        pasta = app.config.dir_playlists / "Lista"
+        shutil.rmtree(pasta, ignore_errors=True)
+        pasta.mkdir(parents=True)
+        # Tudo já baixado como MP3; nada como vídeo
+        for n in range(1, 301):
+            (pasta / f"Vídeo {n}.mp3").write_text("x")
+
+        real = m.fetch_info
+        m.fetch_info = _catalogo(300)
+        try:
+            async with app.run_test(size=(110, 38)) as pilot:
+                app._pilot_atual = pilot
+                await pilot.pause()
+                tela = await _modal_playlist(app)
+                info = str(tela.query_one("#add-info").render())
+                assert "300" in info and "Já tenho" not in info, f"vídeo: {info}"
+
+                tela.query_one("#add-fmt").value = "audio"  # todos existem em MP3
+                await pilot.pause()
+                inicio = time.monotonic()
+                while tela.query_one("#add-loading").display:
+                    if time.monotonic() - inicio > 60:
+                        raise TimeoutError("recoleta não terminou")
+                    await pilot.pause(0.2)
+                await pilot.pause()
+
+                info = str(tela.query_one("#add-info").render())
+                assert "Já tenho" in info and "300" in info, f"áudio: {info}"
+                assert not tela._novos, f"enfileiraria {len(tela._novos)} já baixados"
+                assert tela.query_one("#btn-ok").disabled, "deixou baixar o que já existe"
+
+                tela.query_one("#add-fmt").value = "video:best"  # volta ao vídeo
+                await pilot.pause()
+                inicio = time.monotonic()
+                while tela.query_one("#add-loading").display:
+                    if time.monotonic() - inicio > 60:
+                        raise TimeoutError("recoleta não terminou")
+                    await pilot.pause(0.2)
+                await pilot.pause()
+                assert len(tela._novos) == 300, f"voltou com {len(tela._novos)}"
+        finally:
+            m.fetch_info = real
+
+    asyncio.run(fluxo())
+
+
+@teste("formato: troca com lote paginado refaz a busca")
+def t_troca_formato_paginado():
+    async def fluxo():
+        app = AVDownloaderApp()
+        app.config.auto_update = False
+        app.config.base_dir = str(_TMP / "troca_pag")
+        pasta = app.config.dir_playlists / "Lista"
+        shutil.rmtree(pasta, ignore_errors=True)
+        pasta.mkdir(parents=True)
+        _marcar_baixados(pasta, 500)  # 500 em vídeo; nada em áudio
+
+        real = m.fetch_info
+        m.fetch_info = _catalogo(1200)
+        try:
+            async with app.run_test(size=(110, 38)) as pilot:
+                app._pilot_atual = pilot
+                await pilot.pause()
+                tela = await _modal_playlist(app)
+                # vídeo: pulou os 500 baixados e trouxe os seguintes
+                assert [e["id"] for e in tela._novos][0] == "v501"
+
+                tela.query_one("#add-fmt").value = "audio"
+                await pilot.pause()
+                inicio = time.monotonic()
+                while tela.query_one("#add-loading").display:
+                    if time.monotonic() - inicio > 60:
+                        raise TimeoutError("recoleta")
+                    await pilot.pause(0.2)
+                await pilot.pause()
+                # áudio: nada baixado, então recomeça do primeiro item
+                ids = [e["id"] for e in tela._novos]
+                assert ids[0] == "v1", f"começou em {ids[0]}"
+                assert len(ids) == m.MAX_PLAYLIST_ITEMS, len(ids)
+                info = str(tela.query_one("#add-info").render())
+                assert "Já tenho" not in info, info
+        finally:
+            m.fetch_info = real
+
+    asyncio.run(fluxo())
+
+
+@teste("formato: busca antiga não sobrescreve a nova")
+def t_troca_formato_corrida():
+    async def fluxo():
+        app = AVDownloaderApp()
+        app.config.auto_update = False
+        app.config.base_dir = str(_TMP / "corrida")
+        real = m.fetch_info
+        m.fetch_info = _catalogo(300)
+        try:
+            async with app.run_test(size=(110, 38)) as pilot:
+                app._pilot_atual = pilot
+                await pilot.pause()
+                tela = await _modal_playlist(app)
+                antes = dict(tela._summary)
+
+                # resultado de uma busca já substituída: deve ser descartado
+                tela._geracao = 7
+                tela.run_worker(lambda: tela._fetch("audio", 3), thread=True)
+                inicio = time.monotonic()
+                while time.monotonic() - inicio < 3:
+                    await pilot.pause(0.2)
+                assert tela._summary["fmt_coletado"] == antes["fmt_coletado"], \
+                    "resultado velho sobrescreveu a tela"
+
+                # já o da geração corrente vale
+                tela.run_worker(lambda: tela._fetch("audio", 7), thread=True)
+                inicio = time.monotonic()
+                while tela._summary["fmt_coletado"] != "audio":
+                    if time.monotonic() - inicio > 30:
+                        raise TimeoutError("busca corrente não foi aplicada")
+                    await pilot.pause(0.2)
+        finally:
+            m.fetch_info = real
+
+    asyncio.run(fluxo())
+
+
 @teste("paginação: canal real avança para a 2ª página", rede=True)
 def t_paginacao_rede():
     from yt_dlp.utils import sanitize_filename

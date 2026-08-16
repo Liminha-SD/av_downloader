@@ -1084,6 +1084,7 @@ class AddDownloadScreen(ModalScreen[dict | None]):
         self._novos: list[dict] = []
         self._ja_baixado = False
         self._cancelado = False
+        self._geracao = 0  # descarta resultado de busca já substituída
 
     def compose(self) -> ComposeResult:
         with Container(classes="modal caixa-add"):
@@ -1139,7 +1140,7 @@ class AddDownloadScreen(ModalScreen[dict | None]):
             self.app.call_from_thread(self._status_analise, "Tentando com cookies…")
             return resumir_info(self._url, fetch_info(self._url, self._cfg, usar_cookies=True))
 
-    def _fetch(self, fmt: str = "video:best") -> None:
+    def _fetch(self, fmt: str = "video:best", geracao: int = 0) -> None:
         try:
             summary = self._analisar()
 
@@ -1150,7 +1151,8 @@ class AddDownloadScreen(ModalScreen[dict | None]):
             ignorar_lives = self._cfg.ignorar_lives and not fonte_de_lives(self._url)
 
             if summary["kind"] == "single":
-                self.app.call_from_thread(self._mostrar_info, summary)
+                if geracao == self._geracao:
+                    self.app.call_from_thread(self._mostrar_info, summary)
                 return
 
             if summary["kind"] == "canal":
@@ -1193,9 +1195,12 @@ class AddDownloadScreen(ModalScreen[dict | None]):
                 "fmt_coletado": fmt,
             })
         except Exception as exc:  # rede, URL inválida, bloqueio do site…
-            msg = str(exc)
-            self.app.call_from_thread(self._mostrar_erro, msg)
+            if geracao == self._geracao:
+                msg = str(exc)
+                self.app.call_from_thread(self._mostrar_erro, msg)
             return
+        if geracao != self._geracao:
+            return  # o formato mudou de novo: esta busca já não vale
         self.app.call_from_thread(self._mostrar_info, base)
 
     def _status_analise(self, texto: str) -> None:
@@ -1255,7 +1260,9 @@ class AddDownloadScreen(ModalScreen[dict | None]):
             self._status_analise("Refazendo a busca para o novo formato…")
         except Exception:
             return
-        self.run_worker(lambda: self._fetch(fmt), thread=True, exclusive=True)
+        self._geracao += 1
+        geracao = self._geracao
+        self.run_worker(lambda: self._fetch(fmt, geracao), thread=True, exclusive=True)
 
     def _render_info(self) -> None:
         """Monta o painel — o que já foi baixado depende do formato escolhido."""
@@ -1274,10 +1281,13 @@ class AddDownloadScreen(ModalScreen[dict | None]):
         texto.append(f"{summary['site']}\n")
 
         if summary["kind"] == "playlist":
-            # A busca já entregou só o que falta (ver coletar_lote)
-            self._novos = summary.get("entries") or []
-            vistos = summary.get("vistos", len(self._novos))
-            ja_baixados = summary.get("ja_baixados", 0)
+            # A busca já filtrou pelo formato dela (ver coletar_lote); aqui
+            # reconfere para o formato escolhido agora — o que existe na
+            # pasta muda entre vídeo e áudio.
+            entradas = summary.get("entries") or []
+            self._novos, ja_agora = separar_baixados(entradas, pasta, fmt)
+            vistos = summary.get("vistos", len(entradas))
+            ja_baixados = summary.get("ja_baixados", 0) + len(ja_agora)
             texto.append("Itens    ", "bold")
             texto.append(f"{len(self._novos)}", "bold magenta")
             texto.append(" novos", "bold magenta")
